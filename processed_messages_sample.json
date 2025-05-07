@@ -1,0 +1,44 @@
+[
+  {
+    "message_id": "msg1",
+    "from": "user1",
+    "type": "text",
+    "body": "Hello, this is a test message!",
+    "timestamp": 1715000000,
+    "status": "completed",
+    "keywords": ["test", "hello"],
+    "summary": "A test message."
+  },
+  {
+    "message_id": "msg2",
+    "from": "user2",
+    "type": "voice",
+    "transcription": "This is a transcribed voice note.",
+    "timestamp": 1715000100,
+    "status": "completed",
+    "keywords": ["voice", "note"],
+    "summary": "A transcribed voice note."
+  },
+  {
+    "message_id": "msg3",
+    "from": "user3",
+    "type": "media",
+    "media_url": "https://images.unsplash.com/photo-1506744038136-46273834b3fb",
+    "file_type": "image/jpeg",
+    "file_size": 204800,
+    "timestamp": 1715000200,
+    "status": "completed",
+    "notes": "Media type: image/jpeg"
+  },
+  {
+    "message_id": "msg4",
+    "from": "user4",
+    "type": "document",
+    "media_url": "https://sample-videos.com/doc/sample.pdf",
+    "file_type": "application/pdf",
+    "file_size": 102400,
+    "timestamp": 1715000300,
+    "status": "completed",
+    "notes": "Media type: application/pdf"
+  }
+] 
