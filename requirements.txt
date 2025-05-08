@@ -12,3 +12,4 @@ passlib[bcrypt]==1.7.4
 python-multipart==0.0.9
 email-validator==2.1.0.post1
 apscheduler==3.10.4 
+holidays==0.25

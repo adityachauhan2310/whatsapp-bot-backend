@@ -25,7 +25,9 @@ from utils import process_message, get_processed_messages, transcribe_voice, sum
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from models import (
     GroupConfig, GroupCreate, GroupUpdate, FilterParams, 
-    PaginationParams, GroupStats, MessageType, UserRole
+    PaginationParams, GroupStats, MessageType, UserRole,
+    ParticipantCreate, Participant, ParticipantRole,
+    Message, MessageStatus
 )
 from pymongo.errors import OperationFailure, ConnectionFailure
 from auth import (
@@ -39,6 +41,22 @@ from fastapi.security import OAuth2PasswordRequestForm
 from pathlib import Path
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 import requests
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+import holidays
+import groq
+import logging
+
+# Set up logging to file
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(name)s %(message)s',
+    handlers=[
+        logging.FileHandler("backend.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -156,32 +174,70 @@ async def twilio_webhook(request: Request, background_tasks: BackgroundTasks):
         message_body = form_data.get("Body", None)
         if not message_body:
             print("[ERROR] No 'Body' field in form_data! Full form_data:", dict(form_data))
-        message_data = {
-            "id": form_data.get("MessageSid"),
-            "from": form_data.get("From"),
-            "type": "text",  # Default type
-            "body": message_body if message_body is not None else "",
-            "media_url": form_data.get("MediaUrl0"),  # First media URL if any
-            "group_sid": form_data.get("GroupSid"),   # WhatsApp group SID if applicable
-            "timestamp": time.time(),
-            "raw": dict(form_data)
-        }
+            raise HTTPException(status_code=400, detail="No message body provided")
 
-        # Store raw message in MongoDB
-        db.raw_messages.insert_one(message_data)
+        # Extract group information
+        group_sid = form_data.get("GroupSid")
+        if not group_sid:
+            print("[WARNING] No GroupSid in message. This might be a direct message.")
+            group_sid = "direct_message"  # Default for direct messages
+
+        # Check if today is a holiday or weekend
+        today = datetime.now().date()
+        us_holidays = holidays.US()  # You can change this to your country's holidays
+        
+        if today.weekday() >= 5 or today in us_holidays:  # 5 = Saturday, 6 = Sunday
+            # Create auto-reply document
+            auto_reply = {
+                "group_id": group_sid,
+                "client_number": form_data.get("From"),
+                "reason": "holiday",
+                "reply_text": "We are currently closed for the weekend/holiday. We will respond to your message during our next business day.",
+                "timestamp": datetime.now()
+            }
+            
+            # Insert into auto_replies collection
+            db.auto_replies.insert_one(auto_reply)
+            
+            # Return early with a simple response
+            response = MessagingResponse()
+            return str(response)
+
+        # Continue with normal message processing...
+        # Create message document
+        message_doc = Message(
+            group_id=group_sid,
+            sender=form_data.get("From"),
+            timestamp=datetime.now(),
+            body=message_body,
+            status=MessageStatus.RECEIVED,
+            message_type=MessageType.TEXT,
+            media_url=form_data.get("MediaUrl0"),
+            raw_payload=dict(form_data)
+        ).dict()
+
+        # Store message in MongoDB
+        result = db.messages.insert_one(message_doc)
+        print(f"Stored message with ID: {result.inserted_id}")
 
         # Determine message type
         if form_data.get("MediaUrl0"):
             content_type = form_data.get("MediaContentType0", "")
             if content_type.startswith("audio"):
-                message_data["type"] = "voice"
+                message_doc["message_type"] = MessageType.VOICE
             elif content_type.startswith("application") or content_type.startswith("document"):
-                message_data["type"] = "document"
+                message_doc["message_type"] = MessageType.DOCUMENT
             else:
-                message_data["type"] = "media"
+                message_doc["message_type"] = MessageType.MEDIA
+
+            # Update message type in database
+            db.messages.update_one(
+                {"_id": result.inserted_id},
+                {"$set": {"message_type": message_doc["message_type"]}}
+            )
 
         # Queue for background processing
-        background_tasks.add_task(process_message, message_data)
+        background_tasks.add_task(process_message, message_doc)
 
         # Return TwiML response
         response = MessagingResponse()
@@ -476,9 +532,76 @@ def migrate_media_to_processed():
         raise HTTPException(status_code=500, detail=str(e))
 
 # Initialize scheduler
+scheduler = AsyncIOScheduler()
+
+async def check_message_escalation():
+    """
+    Check for messages that need escalation:
+    1. After 1 hour: Mark as ignored and set notification time
+    2. After 2 hours: Mark as auto-replied
+    """
+    try:
+        current_time = datetime.now()
+        one_hour_ago = current_time - timedelta(hours=1)
+        two_hours_ago = current_time - timedelta(hours=2)
+
+        # Find client messages older than 1 hour with no team reply
+        client_messages = db.messages.find({
+            "timestamp": {"$lt": one_hour_ago},
+            "sender": {"$regex": "^whatsapp:"},  # Client messages
+            "escalation.ignored": {"$ne": True}  # Not already marked as ignored
+        })
+
+        for message in client_messages:
+            # Check if there's a team reply after this message
+            team_reply = db.messages.find_one({
+                "group_id": message["group_id"],
+                "timestamp": {"$gt": message["timestamp"]},
+                "sender": {"$regex": "^team:"}  # Team messages
+            })
+
+            if not team_reply:
+                # Update escalation status
+                update_data = {
+                    "escalation.ignored": True,
+                    "escalation.notified_at": current_time
+                }
+
+                # If message is older than 2 hours, mark as auto-replied
+                if message["timestamp"] < two_hours_ago:
+                    update_data["escalation.auto_replied"] = True
+
+                db.messages.update_one(
+                    {"_id": message["_id"]},
+                    {"$set": update_data}
+                )
+
+                print(f"Escalated message {message['_id']} at {current_time}")
+
+    except Exception as e:
+        print(f"Error in message escalation job: {str(e)}")
+
 @app.on_event("startup")
 async def startup_event():
+    """Initialize scheduler and other startup tasks"""
+    # Start the scheduler
+    scheduler.start()
+    
+    # Add the message escalation job
+    scheduler.add_job(
+        check_message_escalation,
+        trigger=IntervalTrigger(minutes=15),
+        id='message_escalation',
+        replace_existing=True
+    )
+    
+    # Setup other scheduled tasks
     setup_scheduled_tasks()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup tasks on shutdown"""
+    scheduler.shutdown()
 
 # Monitoring Endpoints
 @app.get("/api/monitor/tasks", response_model=Dict)
@@ -612,7 +735,7 @@ async def login_for_access_token(
     remember_me: bool = False
 ):
     import os
-    from fastapi.responses import PlainTextResponse
+    from fastapi.responses import JSONResponse
     print("/api/token called")
     print("form_data.username:", form_data.username)
     print("Environment variables:")
@@ -693,8 +816,12 @@ async def login_for_access_token(
         
     except Exception as e:
         import traceback
-        print("Exception in login_for_access_token:", traceback.format_exc())
-        return PlainTextResponse(f"Internal Server Error: {str(e)}", status_code=500)
+        tb = traceback.format_exc()
+        logger.error(f"Exception in login_for_access_token: {tb}")
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": f"Internal Server Error: {str(e)}"}
+        )
 
 @app.get("/api/auth/verify")
 async def verify_auth(current_user: UserInDB = Depends(get_current_active_user)):
@@ -774,3 +901,427 @@ async def proxy_media(url: str):
     if r.status_code != 200:
         return Response(status_code=r.status_code)
     return StreamingResponse(r.raw, media_type=r.headers.get("Content-Type")) 
+
+@app.post("/api/groups/{group_id}/participants", response_model=Participant)
+async def add_group_participant(
+    group_id: str,
+    participant: ParticipantCreate,
+    current_user: UserInDB = Depends(get_current_active_user)
+):
+    """
+    Add a new participant to a WhatsApp group.
+    Only active users can add participants.
+    """
+    try:
+        # Verify group exists
+        group = db.groups.find_one({"group_sid": group_id})
+        if not group:
+            raise HTTPException(status_code=404, detail="Group not found")
+
+        # Check if participant already exists
+        existing_participant = db.group_participants.find_one({
+            "group_id": group_id,
+            "phone_number": participant.phone_number
+        })
+        if existing_participant:
+            raise HTTPException(
+                status_code=400,
+                detail="Participant already exists in this group"
+            )
+
+        # Create participant document
+        participant_doc = Participant(
+            group_id=group_id,
+            phone_number=participant.phone_number,
+            name=participant.name,
+            role=participant.role
+        ).dict()
+
+        # Insert into database
+        result = db.group_participants.insert_one(participant_doc)
+        
+        # Get the created participant
+        created_participant = db.group_participants.find_one({"_id": result.inserted_id})
+        
+        return Participant(**created_participant)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/groups/{group_id}/participants", response_model=List[Participant])
+async def get_group_participants(
+    group_id: str,
+    current_user: UserInDB = Depends(get_current_active_user)
+):
+    """
+    Get all participants for a specific group.
+    """
+    try:
+        # Verify group exists
+        group = db.groups.find_one({"group_sid": group_id})
+        if not group:
+            raise HTTPException(status_code=404, detail="Group not found")
+
+        # Get all active participants
+        participants = list(db.group_participants.find({
+            "group_id": group_id,
+            "is_active": True
+        }))
+        
+        return [Participant(**p) for p in participants]
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/groups/{group_id}/participants/{phone_number}")
+async def remove_group_participant(
+    group_id: str,
+    phone_number: str,
+    current_user: UserInDB = Depends(get_current_active_user)
+):
+    """
+    Remove a participant from a group (soft delete).
+    """
+    try:
+        # Verify group exists
+        group = db.groups.find_one({"group_sid": group_id})
+        if not group:
+            raise HTTPException(status_code=404, detail="Group not found")
+
+        # Find and update participant
+        result = db.group_participants.update_one(
+            {
+                "group_id": group_id,
+                "phone_number": phone_number
+            },
+            {
+                "$set": {"is_active": False}
+            }
+        )
+
+        if result.modified_count == 0:
+            raise HTTPException(
+                status_code=404,
+                detail="Participant not found in this group"
+            )
+
+        return {"status": "success", "message": "Participant removed from group"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Initialize Groq client
+groq_client = groq.Client(api_key=os.getenv("GROQ_API_KEY"))
+
+async def generate_contextual_reply(group_id: str, num_messages: int = 5) -> Dict:
+    """
+    Generate a contextual reply based on recent messages in a group.
+    
+    Args:
+        group_id: The WhatsApp group ID
+        num_messages: Number of recent messages to consider for context
+        
+    Returns:
+        Dict containing the generated reply and metadata
+    """
+    try:
+        # Fetch recent messages
+        recent_messages = list(db.messages.find(
+            {"group_id": group_id}
+        ).sort("timestamp", -1).limit(num_messages))
+        
+        if not recent_messages:
+            return None
+            
+        # Format messages for context
+        context = "\n".join([
+            f"{msg['sender']}: {msg['body']}"
+            for msg in reversed(recent_messages)
+        ])
+        
+        # Create prompt for Groq
+        prompt = f"""Based on the following WhatsApp conversation, generate a helpful and contextual response.
+        The response should be professional, concise, and address any questions or concerns raised.
+        
+        Recent messages:
+        {context}
+        
+        Generate a response:"""
+        
+        # Call Groq API
+        completion = groq_client.chat.completions.create(
+            model="mixtral-8x7b-32768",  # or another appropriate model
+            messages=[
+                {"role": "system", "content": "You are a helpful customer service assistant."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=150
+        )
+        
+        reply_text = completion.choices[0].message.content.strip()
+        
+        # Create auto-reply document
+        auto_reply = {
+            "group_id": group_id,
+            "client_number": recent_messages[0]["sender"],  # Reply to the most recent message
+            "reason": "contextual",
+            "reply_text": reply_text,
+            "timestamp": datetime.now(),
+            "generated_by": "groq",
+            "reviewed": True,
+            "context_messages": [str(msg["_id"]) for msg in recent_messages]
+        }
+        
+        # Store in auto_replies collection
+        result = db.auto_replies.insert_one(auto_reply)
+        auto_reply["_id"] = result.inserted_id
+        
+        return auto_reply
+        
+    except Exception as e:
+        print(f"Error generating contextual reply: {str(e)}")
+        return None
+
+@app.post("/api/groups/{group_id}/auto-reply")
+async def generate_auto_reply(
+    group_id: str,
+    num_messages: int = Query(5, ge=1, le=10),
+    current_user: UserInDB = Depends(get_current_active_user)
+):
+    """
+    Generate and store an auto-reply for a group based on recent messages.
+    """
+    try:
+        # Verify group exists
+        group = db.groups.find_one({"group_sid": group_id})
+        if not group:
+            raise HTTPException(status_code=404, detail="Group not found")
+            
+        # Generate reply
+        auto_reply = await generate_contextual_reply(group_id, num_messages)
+        
+        if not auto_reply:
+            raise HTTPException(
+                status_code=400,
+                detail="No messages found to generate context from"
+            )
+            
+        return auto_reply
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/groups/{group_id}/auto-replies")
+async def get_auto_replies(
+    group_id: str,
+    skip: int = 0,
+    limit: int = 10,
+    current_user: UserInDB = Depends(get_current_active_user)
+):
+    """
+    Get auto-replies for a group.
+    """
+    try:
+        # Verify group exists
+        group = db.groups.find_one({"group_sid": group_id})
+        if not group:
+            raise HTTPException(status_code=404, detail="Group not found")
+            
+        # Get auto-replies
+        auto_replies = list(db.auto_replies.find(
+            {"group_id": group_id}
+        ).sort("timestamp", -1).skip(skip).limit(limit))
+        
+        # Convert ObjectId to string for JSON serialization
+        for reply in auto_replies:
+            reply["_id"] = str(reply["_id"])
+            
+        return {
+            "auto_replies": auto_replies,
+            "total": db.auto_replies.count_documents({"group_id": group_id})
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/groups/{group_id}/messages")
+async def get_group_messages(
+    group_id: str,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None,
+    message_type: Optional[MessageType] = None,
+    current_user: UserInDB = Depends(get_current_active_user)
+):
+    """
+    Get messages for a specific group with pagination and filtering.
+    """
+    try:
+        # Verify group exists
+        group = db.groups.find_one({"group_sid": group_id})
+        if not group:
+            raise HTTPException(status_code=404, detail="Group not found")
+
+        # Build query
+        query = {"group_id": group_id}
+        if start_date:
+            query["timestamp"] = {"$gte": start_date}
+        if end_date:
+            query.setdefault("timestamp", {})["$lte"] = end_date
+        if message_type:
+            query["message_type"] = message_type
+
+        # Get messages with pagination
+        messages = list(db.messages.find(query)
+                       .sort("timestamp", -1)
+                       .skip(skip)
+                       .limit(limit))
+
+        # Convert ObjectId to string for JSON serialization
+        for msg in messages:
+            msg["_id"] = str(msg["_id"])
+
+        # Get total count for pagination
+        total = db.messages.count_documents(query)
+
+        return {
+            "messages": messages,
+            "total": total,
+            "page": (skip // limit) + 1,
+            "page_size": limit,
+            "total_pages": (total + limit - 1) // limit
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/groups/{group_id}/escalations")
+async def get_group_escalations(
+    group_id: str,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None,
+    status: Optional[str] = None,  # 'ignored', 'auto_replied', etc.
+    current_user: UserInDB = Depends(get_current_active_user)
+):
+    """
+    Get escalated messages for a specific group with pagination and filtering.
+    """
+    try:
+        # Verify group exists
+        group = db.groups.find_one({"group_sid": group_id})
+        if not group:
+            raise HTTPException(status_code=404, detail="Group not found")
+
+        # Build query
+        query = {
+            "group_id": group_id,
+            "escalation": {"$exists": True}
+        }
+        if start_date:
+            query["timestamp"] = {"$gte": start_date}
+        if end_date:
+            query.setdefault("timestamp", {})["$lte"] = end_date
+        if status:
+            if status == "ignored":
+                query["escalation.ignored"] = True
+            elif status == "auto_replied":
+                query["escalation.auto_replied"] = True
+
+        # Get messages with pagination
+        messages = list(db.messages.find(query)
+                       .sort("timestamp", -1)
+                       .skip(skip)
+                       .limit(limit))
+
+        # Convert ObjectId to string for JSON serialization
+        for msg in messages:
+            msg["_id"] = str(msg["_id"])
+
+        # Get total count for pagination
+        total = db.messages.count_documents(query)
+
+        return {
+            "escalations": messages,
+            "total": total,
+            "page": (skip // limit) + 1,
+            "page_size": limit,
+            "total_pages": (total + limit - 1) // limit
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/groups/{group_id}/auto_replies")
+async def get_group_auto_replies(
+    group_id: str,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None,
+    reason: Optional[str] = None,  # 'holiday', 'contextual', etc.
+    reviewed: Optional[bool] = None,
+    current_user: UserInDB = Depends(get_current_active_user)
+):
+    """
+    Get auto-replies for a specific group with pagination and filtering.
+    """
+    try:
+        # Verify group exists
+        group = db.groups.find_one({"group_sid": group_id})
+        if not group:
+            raise HTTPException(status_code=404, detail="Group not found")
+
+        # Build query
+        query = {"group_id": group_id}
+        if start_date:
+            query["timestamp"] = {"$gte": start_date}
+        if end_date:
+            query.setdefault("timestamp", {})["$lte"] = end_date
+        if reason:
+            query["reason"] = reason
+        if reviewed is not None:
+            query["reviewed"] = reviewed
+
+        # Get auto-replies with pagination
+        auto_replies = list(db.auto_replies.find(query)
+                          .sort("timestamp", -1)
+                          .skip(skip)
+                          .limit(limit))
+
+        # Convert ObjectId to string for JSON serialization
+        for reply in auto_replies:
+            reply["_id"] = str(reply["_id"])
+
+        # Get total count for pagination
+        total = db.auto_replies.count_documents(query)
+
+        return {
+            "auto_replies": auto_replies,
+            "total": total,
+            "page": (skip // limit) + 1,
+            "page_size": limit,
+            "total_pages": (total + limit - 1) // limit
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) 

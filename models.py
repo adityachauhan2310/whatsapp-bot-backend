@@ -1,7 +1,8 @@
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Optional, List, Dict
 from datetime import datetime
 from enum import Enum
+from pydantic import EmailStr
 
 class UserRole(str, Enum):
     ADMIN = "admin"
@@ -12,6 +13,11 @@ class MessageType(str, Enum):
     VOICE = "voice"
     MEDIA = "media"
     DOCUMENT = "document"
+
+class ParticipantRole(str, Enum):
+    TEAM = "team"
+    CLIENT = "client"
+    LEADER = "leader"
 
 class GroupConfig(BaseModel):
     """Configuration for a WhatsApp group"""
@@ -58,4 +64,35 @@ class GroupStats(BaseModel):
     message_types: dict
     keywords: List[str]
     active_users: int
-    last_activity: datetime 
+    last_activity: datetime
+
+class ParticipantCreate(BaseModel):
+    phone_number: str
+    name: str
+    role: ParticipantRole
+
+class Participant(ParticipantCreate):
+    group_id: str
+    added_at: datetime = datetime.now()
+    is_active: bool = True
+
+class MessageStatus(str, Enum):
+    RECEIVED = "received"
+    PROCESSED = "processed"
+    FAILED = "failed"
+
+class Message(BaseModel):
+    """Model for storing WhatsApp messages"""
+    group_id: str
+    sender: str
+    timestamp: datetime
+    body: str
+    status: MessageStatus = MessageStatus.RECEIVED
+    message_type: MessageType = MessageType.TEXT
+    media_url: Optional[str] = None
+    raw_payload: Optional[Dict] = None
+    escalation: Optional[Dict] = Field(default_factory=lambda: {
+        "ignored": False,
+        "notified_at": None,
+        "auto_replied": False
+    }) 
