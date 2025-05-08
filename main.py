@@ -33,7 +33,7 @@ from pymongo.errors import OperationFailure, ConnectionFailure
 from auth import (
     Token, UserCreate, UserInDB, get_password_hash, verify_password,
     create_access_token, get_current_user, get_current_active_user,
-    get_current_admin_user, create_refresh_token, add_refresh_token,
+    get_current_admin_user, create_refresh_token, add_refresh_token, remove_refresh_token,
     ACCESS_TOKEN_EXPIRE_MINUTES, generate_token, send_verification_email
 )
 from scheduler import monitor, setup_scheduled_tasks
@@ -46,6 +46,8 @@ from apscheduler.triggers.interval import IntervalTrigger
 import holidays
 import groq
 import logging
+from twilio.rest import Client as TwilioClient
+from jose import JWTError, jwt
 
 # Set up logging to file
 logging.basicConfig(
@@ -76,6 +78,9 @@ if missing_vars:
 # Twilio credentials from .env
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+
+# Twilio WhatsApp sender (from) number from environment
+TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM")
 
 # MongoDB connection with error handling
 try:
@@ -534,6 +539,35 @@ def migrate_media_to_processed():
 # Initialize scheduler
 scheduler = AsyncIOScheduler()
 
+# Initialize Twilio REST client
+_twilio_client = None
+def get_twilio_client():
+    global _twilio_client
+    if _twilio_client is None:
+        _twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    return _twilio_client
+
+async def notify_leader_via_whatsapp(group_id, message):
+    # Find the leader participant for this group
+    leader = db.group_participants.find_one({"group_id": group_id, "role": "leader", "is_active": True})
+    if not leader:
+        logger.warning(f"No leader found for group {group_id} to notify.")
+        return
+    leader_number = leader["phone_number"]
+    # Compose notification message
+    notification = f"[Escalation] Client message missed by team.\nMessage: {message['body']}\nFrom: {message['sender']}\nTime: {message['timestamp']}"
+    # Send WhatsApp message via Twilio
+    try:
+        client = get_twilio_client()
+        client.messages.create(
+            from_=f"whatsapp:{TWILIO_WHATSAPP_FROM}",
+            to=f"whatsapp:{leader_number}",
+            body=notification
+        )
+        logger.info(f"Escalation notification sent to leader {leader_number} for group {group_id}")
+    except Exception as e:
+        logger.error(f"Failed to send escalation notification to leader: {str(e)}")
+
 async def check_message_escalation():
     """
     Check for messages that need escalation:
@@ -575,6 +609,9 @@ async def check_message_escalation():
                     {"_id": message["_id"]},
                     {"$set": update_data}
                 )
+
+                # Notify leader via WhatsApp
+                await notify_leader_via_whatsapp(message["group_id"], message)
 
                 print(f"Escalated message {message['_id']} at {current_time}")
 
@@ -1324,4 +1361,40 @@ async def get_group_auto_replies(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/refresh-token")
+async def refresh_token_endpoint(payload: dict = Body(...)):
+    """
+    Accepts a refresh_token and returns a new access_token and refresh_token if valid.
+    """
+    refresh_token = payload.get("refresh_token")
+    if not refresh_token:
+        return JSONResponse(status_code=400, content={"error": "refresh_token is required"})
+    try:
+        from auth import SECRET_KEY, ALGORITHM, db
+        payload = jwt.decode(refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("type") != "refresh":
+            raise HTTPException(status_code=401, detail="Invalid token type")
+        username = payload.get("sub")
+        if not username:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        user = db.users.find_one({"username": username})
+        if not user or refresh_token not in user.get("refresh_tokens", []):
+            raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
+        # Issue new tokens
+        access_token = create_access_token(
+            data={"sub": username, "role": user["role"]},
+            expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        )
+        new_refresh_token = create_refresh_token(username)
+        await add_refresh_token(username, new_refresh_token)
+        await remove_refresh_token(username, refresh_token)
+        return {
+            "access_token": access_token,
+            "refresh_token": new_refresh_token
+        }
+    except JWTError:
+        return JSONResponse(status_code=401, content={"error": "Invalid or expired refresh token"})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)}) 
