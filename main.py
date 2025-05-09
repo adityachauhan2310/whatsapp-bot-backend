@@ -244,6 +244,38 @@ async def twilio_webhook(request: Request, background_tasks: BackgroundTasks):
         # Queue for background processing
         background_tasks.add_task(process_message, message_doc)
 
+        # --- Auto-create group and participant on new group message ---
+        if group_sid != "direct_message":
+            # Check if group exists
+            group = db.groups.find_one({"group_sid": group_sid})
+            if not group:
+                group_doc = {
+                    "group_sid": group_sid,
+                    "name": f"WhatsApp Group {group_sid[-4:]}" if group_sid else "Unknown Group",
+                    "description": None,
+                    "is_active": True,
+                    "keywords": [],
+                    "notification_settings": {}
+                }
+                db.groups.insert_one(group_doc)
+            # Check if participant exists
+            sender_number = form_data.get("From")
+            participant = db.group_participants.find_one({
+                "group_id": group_sid,
+                "phone_number": sender_number
+            })
+            if not participant:
+                participant_doc = {
+                    "group_id": group_sid,
+                    "phone_number": sender_number,
+                    "name": sender_number,  # Default to number; can be updated later
+                    "role": "client",
+                    "added_at": datetime.now().isoformat(),
+                    "is_active": True
+                }
+                db.group_participants.insert_one(participant_doc)
+        # --- End auto-create logic ---
+
         # Return TwiML response
         response = MessagingResponse()
         return str(response)
@@ -398,6 +430,19 @@ async def get_processed_messages_endpoint(
         for msg in messages:
             if "_id" in msg:
                 msg["_id"] = str(msg["_id"])
+        # Ensure body/content is present
+        for msg in messages:
+            if "body" not in msg:
+                if "content" in msg:
+                    msg["body"] = msg["content"]
+                elif "text" in msg:
+                    msg["body"] = msg["text"]
+                elif "transcription" in msg:
+                    msg["body"] = msg["transcription"]
+                elif "notes" in msg:
+                    msg["body"] = msg["notes"]
+                else:
+                    msg["body"] = None
         return {
             "messages": messages,
             "total": total,
@@ -758,6 +803,19 @@ async def search_messages(
     skip = (page - 1) * page_size
     messages = list(db.processed_messages.find(query).sort("timestamp", DESCENDING).skip(skip).limit(page_size))
     total = db.processed_messages.count_documents(query)
+    # Ensure body/content is present for /api/messages/search
+    for msg in messages:
+        if "body" not in msg:
+            if "content" in msg:
+                msg["body"] = msg["content"]
+            elif "text" in msg:
+                msg["body"] = msg["text"]
+            elif "transcription" in msg:
+                msg["body"] = msg["transcription"]
+            elif "notes" in msg:
+                msg["body"] = msg["notes"]
+            else:
+                msg["body"] = None
     return {
         "messages": messages,
         "total": total,
@@ -973,7 +1031,9 @@ async def add_group_participant(
             name=participant.name,
             role=participant.role
         ).dict()
-
+        # Ensure 'added_at' and 'is_active' are set
+        participant_doc["added_at"] = datetime.now().isoformat()
+        participant_doc["is_active"] = True
         # Insert into database
         result = db.group_participants.insert_one(participant_doc)
         
@@ -1006,7 +1066,12 @@ async def get_group_participants(
             "group_id": group_id,
             "is_active": True
         }))
-        
+        # Ensure 'added_at' is always a valid ISO string
+        for p in participants:
+            if "added_at" not in p or not p["added_at"]:
+                p["added_at"] = datetime.now().isoformat()
+            elif isinstance(p["added_at"], datetime):
+                p["added_at"] = p["added_at"].isoformat()
         return [Participant(**p) for p in participants]
 
     except HTTPException:
@@ -1233,6 +1298,20 @@ async def get_group_messages(
         # Get total count for pagination
         total = db.messages.count_documents(query)
 
+        # Ensure body/content is present for /api/groups/{group_id}/messages
+        for msg in messages:
+            if "body" not in msg:
+                if "content" in msg:
+                    msg["body"] = msg["content"]
+                elif "text" in msg:
+                    msg["body"] = msg["text"]
+                elif "transcription" in msg:
+                    msg["body"] = msg["transcription"]
+                elif "notes" in msg:
+                    msg["body"] = msg["notes"]
+                else:
+                    msg["body"] = None
+
         return {
             "messages": messages,
             "total": total,
@@ -1398,3 +1477,96 @@ async def refresh_token_endpoint(payload: dict = Body(...)):
         return JSONResponse(status_code=401, content={"error": "Invalid or expired refresh token"})
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)}) 
+
+@app.get("/api/whatsapp/groups-and-contacts")
+async def list_groups_and_contacts(current_user: UserInDB = Depends(get_current_active_user)):
+    """
+    List all WhatsApp groups the bot is a member of and all direct contacts who have messaged the bot.
+    For each group: return group name, group SID, participant list, and latest message.
+    For each direct contact: return WhatsApp number, name (if available), and latest message.
+    """
+    # Groups
+    groups = list(db.groups.find())
+    group_infos = []
+    for group in groups:
+        group_sid = group["group_sid"]
+        participants = list(db.group_participants.find({"group_id": group_sid, "is_active": True}))
+        latest_msg = db.messages.find_one({"group_id": group_sid}, sort=[("timestamp", -1)])
+        # Ensure body/content is present for latest_msg
+        latest_body = None
+        if latest_msg:
+            if "body" in latest_msg:
+                latest_body = latest_msg["body"]
+            elif "content" in latest_msg:
+                latest_body = latest_msg["content"]
+            elif "text" in latest_msg:
+                latest_body = latest_msg["text"]
+            elif "transcription" in latest_msg:
+                latest_body = latest_msg["transcription"]
+            elif "notes" in latest_msg:
+                latest_body = latest_msg["notes"]
+        group_infos.append({
+            "group_sid": group_sid,
+            "group_name": group.get("name"),
+            "participants": [
+                {
+                    "name": p.get("name"),
+                    "phone_number": p.get("phone_number"),
+                    "role": p.get("role")
+                } for p in participants
+            ],
+            "latest_message": {
+                "body": latest_body,
+                "timestamp": latest_msg["timestamp"] if latest_msg else None
+            }
+        })
+    # Direct contacts
+    direct_msgs = db.messages.find({"group_id": "direct_message"})
+    contacts = {}
+    for msg in direct_msgs:
+        sender = msg["sender"]
+        # Ensure body/content is present for contact latest_message
+        contact_body = None
+        if "body" in msg:
+            contact_body = msg["body"]
+        elif "content" in msg:
+            contact_body = msg["content"]
+        elif "text" in msg:
+            contact_body = msg["text"]
+        elif "transcription" in msg:
+            contact_body = msg["transcription"]
+        elif "notes" in msg:
+            contact_body = msg["notes"]
+        if sender not in contacts or msg["timestamp"] > contacts[sender]["timestamp"]:
+            contacts[sender] = {
+                "whatsapp_number": sender,
+                "name": msg.get("sender_name"),
+                "latest_message": {
+                    "body": contact_body,
+                    "timestamp": msg["timestamp"]
+                }
+            }
+    return {
+        "groups": group_infos,
+        "contacts": list(contacts.values())
+    }
+
+@app.get("/api/whatsapp/group/{group_sid}/history")
+async def get_group_history(group_sid: str, skip: int = 0, limit: int = 100, current_user: UserInDB = Depends(get_current_active_user)):
+    """
+    Fetch full conversation history for a group.
+    """
+    messages = list(db.messages.find({"group_id": group_sid}).sort("timestamp", 1).skip(skip).limit(limit))
+    for msg in messages:
+        msg["_id"] = str(msg["_id"])
+    return {"messages": messages}
+
+@app.get("/api/whatsapp/contact/{phone_number}/history")
+async def get_contact_history(phone_number: str, skip: int = 0, limit: int = 100, current_user: UserInDB = Depends(get_current_active_user)):
+    """
+    Fetch full conversation history for a direct contact.
+    """
+    messages = list(db.messages.find({"group_id": "direct_message", "sender": phone_number}).sort("timestamp", 1).skip(skip).limit(limit))
+    for msg in messages:
+        msg["_id"] = str(msg["_id"])
+    return {"messages": messages} 
