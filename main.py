@@ -15,12 +15,12 @@ import os
 from dotenv import load_dotenv
 from twilio.request_validator import RequestValidator
 from twilio.twiml.messaging_response import MessagingResponse
-from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Depends, status, Response, Query, Body
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Depends, status, Response, Query, Body, File, UploadFile, Path
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict, Optional
 import time
 from datetime import datetime, timedelta
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from utils import process_message, get_processed_messages, transcribe_voice, summarize_text
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from models import (
@@ -29,6 +29,7 @@ from models import (
     ParticipantCreate, Participant, ParticipantRole,
     Message, MessageStatus
 )
+from models import UserOut
 from pymongo.errors import OperationFailure, ConnectionFailure
 from auth import (
     Token, UserCreate, UserInDB, get_password_hash, verify_password,
@@ -38,7 +39,7 @@ from auth import (
 )
 from scheduler import monitor, setup_scheduled_tasks
 from fastapi.security import OAuth2PasswordRequestForm
-from pathlib import Path
+from pathlib import Path as OSPath
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 import requests
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -48,6 +49,15 @@ import groq
 import logging
 from twilio.rest import Client as TwilioClient
 from jose import JWTError, jwt
+from pymongo import errors
+import shutil
+from ai_prompts import (
+    group_summary_prompt,
+    contextual_reply_system_prompt,
+    contextual_reply_user_prompt
+)
+from bson import ObjectId
+import re
 
 # Set up logging to file
 logging.basicConfig(
@@ -82,19 +92,24 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 # Twilio WhatsApp sender (from) number from environment
 TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM")
 
-# MongoDB connection with error handling
-try:
-    client = MongoClient(os.getenv("MONGODB_URI"), serverSelectionTimeoutMS=5000)
-    # Test the connection
-    client.server_info()
-    db = client[os.getenv("MONGODB_DB")]
-    print("Successfully connected to MongoDB")
-except ConnectionFailure as e:
-    print(f"Failed to connect to MongoDB: {str(e)}")
-    raise
-except Exception as e:
-    print(f"Unexpected error connecting to MongoDB: {str(e)}")
-    raise
+# MongoDB connection with retry logic
+def get_mongo_client():
+    retries = 10
+    for i in range(retries):
+        try:
+            client = MongoClient(os.getenv("MONGODB_URI"), serverSelectionTimeoutMS=5000)
+            # Try to connect
+            client.server_info()
+            print("Successfully connected to MongoDB")
+            return client
+        except errors.ServerSelectionTimeoutError as err:
+            print(f"MongoDB connection failed: {err}, retrying in 5 seconds...")
+            time.sleep(5)
+    print("Could not connect to MongoDB after several retries. Continuing without DB connection.")
+    return None
+
+client = get_mongo_client()
+db = client[os.getenv("MONGODB_DB")] if client else None
 
 # Create text index for keyword search
 try:
@@ -139,6 +154,22 @@ class SearchRequest(BaseModel):
 class TextRequest(BaseModel):
     text: str
 
+class ParticipantAddRequest(BaseModel):
+    user_id: str  # or phone_number
+    name: str
+    role: str  # 'team', 'client', 'leader'
+
+class ParticipantRoleUpdateRequest(BaseModel):
+    new_role: str  # 'team', 'client', 'leader'
+
+class HolidayCreateRequest(BaseModel):
+    date: str
+    description: Optional[str] = None
+
+class WorkingHoursRequest(BaseModel):
+    start: str  # e.g. '09:00'
+    end: str    # e.g. '18:00'
+
 # Background task to process incoming messages
 async def process_incoming_message(message_data: Dict):
     # Simulate processing delay
@@ -146,6 +177,11 @@ async def process_incoming_message(message_data: Dict):
     # Store message in MongoDB
     db.messages.insert_one(message_data)
     print(f"Processed and stored message: {message_data}")
+
+# Helper to check DB connection
+def ensure_db():
+    if db is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database is temporarily unavailable. Please try again later.")
 
 @app.get("/health")
 async def health_check():
@@ -157,6 +193,7 @@ async def health_check():
 @app.post("/webhook/twilio")
 async def twilio_webhook(request: Request, background_tasks: BackgroundTasks):
     """Twilio webhook endpoint for processing incoming WhatsApp messages."""
+    ensure_db()
     try:
         # TEST BYPASS: Skip signature check if ?test=true is present
         skip_signature = request.query_params.get("test") == "true"
@@ -187,11 +224,33 @@ async def twilio_webhook(request: Request, background_tasks: BackgroundTasks):
             print("[WARNING] No GroupSid in message. This might be a direct message.")
             group_sid = "direct_message"  # Default for direct messages
 
-        # Check if today is a holiday or weekend
+        # Check if today is a holiday or weekend using company_holidays collection
         today = datetime.now().date()
-        us_holidays = holidays.US()  # You can change this to your country's holidays
-        
-        if today.weekday() >= 5 or today in us_holidays:  # 5 = Saturday, 6 = Sunday
+        is_weekend = today.weekday() >= 5  # 5 = Saturday, 6 = Sunday
+        # Query company_holidays for today
+        holiday_doc = db.company_holidays.find_one({"date": today.isoformat()})
+        is_company_holiday = holiday_doc is not None
+        # --- Working hours check ---
+        wh = db.company_working_hours.find_one()
+        if wh:
+            now = datetime.now().time()
+            from datetime import datetime as dt
+            start = dt.strptime(wh['start'], "%H:%M").time()
+            end = dt.strptime(wh['end'], "%H:%M").time()
+            if not (start <= now <= end):
+                auto_reply = {
+                    "group_id": group_sid,
+                    "client_number": form_data.get("From"),
+                    "reason": "after_hours",
+                    "reply_text": f"Our team is available from {start.strftime('%H:%M')} to {end.strftime('%H:%M')}. We will respond to your message during working hours.",
+                    "timestamp": datetime.now()
+                }
+                db.auto_replies.insert_one(auto_reply)
+                response = MessagingResponse()
+                response.message(f"Thank you for your message. Our working hours are {start.strftime('%H:%M')} to {end.strftime('%H:%M')}. We will respond during business hours.")
+                return str(response)
+        # --- End working hours check ---
+        if is_weekend or is_company_holiday:
             # Create auto-reply document
             auto_reply = {
                 "group_id": group_sid,
@@ -200,10 +259,8 @@ async def twilio_webhook(request: Request, background_tasks: BackgroundTasks):
                 "reply_text": "We are currently closed for the weekend/holiday. We will respond to your message during our next business day.",
                 "timestamp": datetime.now()
             }
-            
             # Insert into auto_replies collection
             db.auto_replies.insert_one(auto_reply)
-            
             # Return early with a simple response
             response = MessagingResponse()
             return str(response)
@@ -285,12 +342,29 @@ async def twilio_webhook(request: Request, background_tasks: BackgroundTasks):
         print("Webhook error:", traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/webhook/twilio-status")
+async def twilio_status_webhook(request: Request):
+    ensure_db()
+    data = await request.form()
+    message_sid = data.get("MessageSid")
+    event_type = data.get("MessageStatus")  # e.g., 'delivered', 'sent', etc.
+    if message_sid and event_type == "delivered":
+        # Find the message with escalation.alert_sid == message_sid
+        result = db.messages.update_one(
+            {"escalation.alert_sid": message_sid},
+            {"$set": {"escalation.delivered": True}}
+        )
+        if result.modified_count > 0:
+            print(f"Marked escalation {message_sid} as delivered.")
+    return {"status": "ok"}
+
 @app.post("/api/groups", response_model=GroupConfig)
 async def create_group(
     group: GroupCreate,
     current_user: UserInDB = Depends(get_current_active_user)
 ):
     """Create a new WhatsApp group configuration."""
+    ensure_db()
     try:
         group_config = GroupConfig(
             group_sid=f"GRP_{int(time.time())}",
@@ -307,6 +381,7 @@ async def create_group(
 
 @app.get("/api/groups", response_model=List[GroupConfig])
 async def list_groups():
+    ensure_db()
     try:
         groups = list(db.groups.find())
         return [GroupConfig(**group) for group in groups]
@@ -315,6 +390,7 @@ async def list_groups():
 
 @app.get("/api/groups/{group_sid}", response_model=GroupConfig)
 async def get_group(group_sid: str):
+    ensure_db()
     try:
         group = db.groups.find_one({"group_sid": group_sid})
         if not group:
@@ -327,6 +403,7 @@ async def get_group(group_sid: str):
 
 @app.put("/api/groups/{group_sid}", response_model=GroupConfig)
 async def update_group(group_sid: str, group_update: GroupUpdate):
+    ensure_db()
     try:
         update_data = {k: v for k, v in group_update.dict().items() if v is not None}
         if not update_data:
@@ -346,6 +423,7 @@ async def update_group(group_sid: str, group_update: GroupUpdate):
 
 @app.delete("/api/groups/{group_sid}")
 async def delete_group(group_sid: str):
+    ensure_db()
     try:
         result = db.groups.delete_one({"group_sid": group_sid})
         if result.deleted_count == 0:
@@ -359,6 +437,7 @@ async def delete_group(group_sid: str):
 @app.get("/api/groups/{group_sid}/stats", response_model=GroupStats)
 async def get_group_stats(group_sid: str):
     """Get statistics for a specific group."""
+    ensure_db()
     try:
         # Get total messages
         total_messages = db.processed_messages.count_documents({"group_sid": group_sid})
@@ -399,6 +478,7 @@ async def get_processed_messages_endpoint(
     filters: FilterParams = Depends(),
     pagination: PaginationParams = Depends()
 ):
+    ensure_db()
     try:
         # Build query
         query = {}
@@ -460,6 +540,7 @@ async def process_message_alias(
     filters: FilterParams = Depends(),
     pagination: PaginationParams = Depends()
 ):
+    ensure_db()
     try:
         return await get_processed_messages_endpoint(filters, pagination)
     except Exception as e:
@@ -473,6 +554,7 @@ async def get_daily_summaries(
     start_date: Optional[datetime] = None,
     end_date: Optional[datetime] = None
 ):
+    ensure_db()
     try:
         query = {}
         if group_sid:
@@ -488,6 +570,7 @@ async def get_daily_summaries(
 
 @app.post("/api/summary/search")
 async def search_summaries(request: SearchRequest):
+    ensure_db()
     try:
         if not request.keyword.strip():
             raise HTTPException(status_code=400, detail="Keyword cannot be empty")
@@ -521,6 +604,7 @@ async def search_summaries(request: SearchRequest):
 
 @app.get("/api/media/latest")
 async def get_latest_media():
+    ensure_db()
     try:
         media_items = list(db.media.find({}, {"_id": 0}))
         return {"media_items": media_items}
@@ -533,6 +617,7 @@ async def transcribe_voice_endpoint():
     Endpoint to transcribe voice input.
     Returns the transcribed text.
     """
+    ensure_db()
     try:
         transcribed_text = transcribe_voice()
         return {"transcription": transcribed_text}
@@ -545,6 +630,7 @@ async def summarize_text_endpoint(request: TextRequest):
     Endpoint to summarize text input.
     Returns the summarized text.
     """
+    ensure_db()
     try:
         if not request.text.strip():
             raise HTTPException(status_code=400, detail="Text cannot be empty")
@@ -558,6 +644,7 @@ async def summarize_text_endpoint(request: TextRequest):
 
 @app.post("/api/migrate_media_to_processed")
 def migrate_media_to_processed():
+    ensure_db()
     try:
         media_docs = list(db.media.find())
         migrated = 0
@@ -618,47 +705,76 @@ async def check_message_escalation():
     Check for messages that need escalation:
     1. After 1 hour: Mark as ignored and set notification time
     2. After 2 hours: Mark as auto-replied
+    3. Lookup leader, send Twilio Conversations notification, store alert_sid
     """
     try:
         current_time = datetime.now()
         one_hour_ago = current_time - timedelta(hours=1)
         two_hours_ago = current_time - timedelta(hours=2)
 
-        # Find client messages older than 1 hour with no team reply
         client_messages = db.messages.find({
             "timestamp": {"$lt": one_hour_ago},
-            "sender": {"$regex": "^whatsapp:"},  # Client messages
-            "escalation.ignored": {"$ne": True}  # Not already marked as ignored
+            "sender": {"$regex": "^whatsapp:"},
+            "escalation.ignored": {"$ne": True}
         })
 
         for message in client_messages:
-            # Check if there's a team reply after this message
             team_reply = db.messages.find_one({
                 "group_id": message["group_id"],
                 "timestamp": {"$gt": message["timestamp"]},
-                "sender": {"$regex": "^team:"}  # Team messages
+                "sender": {"$regex": "^team:"}
             })
 
             if not team_reply:
-                # Update escalation status
                 update_data = {
                     "escalation.ignored": True,
                     "escalation.notified_at": current_time
                 }
-
-                # If message is older than 2 hours, mark as auto-replied
                 if message["timestamp"] < two_hours_ago:
                     update_data["escalation.auto_replied"] = True
+
+                # Lookup leader's phone_number
+                leader = db.group_participants.find_one({
+                    "group_id": message["group_id"],
+                    "role": "leader",
+                    "is_active": True
+                })
+                alert_sid = None
+                if leader:
+                    leader_number = leader.get("phone_number")
+                    try:
+                        twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+                        # Find the conversation for this group (assume friendly_name == group_id)
+                        conversations = twilio_client.conversations.conversations.list(friendly_name=message["group_id"])
+                        if conversations:
+                            conversation_sid = conversations[0].sid
+                            notification = (
+                                f"[Escalation] Client message missed by team.\n"
+                                f"Message: {message['body']}\n"
+                                f"From: {message['sender']}\n"
+                                f"Time: {message['timestamp']}"
+                            )
+                            msg = twilio_client.conversations.conversations(conversation_sid).messages.create(
+                                author="system",
+                                body=notification
+                            )
+                            alert_sid = msg.sid
+                            update_data["escalation.alert_sid"] = alert_sid
+                        else:
+                            print(f"No Twilio conversation found for group_id {message['group_id']}")
+                    except Exception as twilio_err:
+                        print(f"Twilio notification failed: {twilio_err}")
+                        update_data["escalation.alert_sid"] = None
+                else:
+                    print(f"No leader found for group {message['group_id']} to notify.")
+                    update_data["escalation.alert_sid"] = None
 
                 db.messages.update_one(
                     {"_id": message["_id"]},
                     {"$set": update_data}
                 )
 
-                # Notify leader via WhatsApp
-                await notify_leader_via_whatsapp(message["group_id"], message)
-
-                print(f"Escalated message {message['_id']} at {current_time}")
+                print(f"Escalated message {message['_id']} at {current_time}, alert_sid: {alert_sid}")
 
     except Exception as e:
         print(f"Error in message escalation job: {str(e)}")
@@ -703,26 +819,52 @@ async def list_users(current_user: UserInDB = Depends(get_current_admin_user)):
     users = list(db.users.find())
     return [UserInDB(**u) for u in users]
 
-@app.get("/api/users/{username}", response_model=UserInDB, tags=["User Management"])
-async def get_user(username: str, current_user: UserInDB = Depends(get_current_active_user)):
-    # Only allow users to fetch their own info, or admins to fetch anyone's
+def serialize_user(user):
+    # Accepts a dict or Pydantic model
+    return {
+        "id": user.get("username") if isinstance(user, dict) else getattr(user, "username", None),
+        "username": user.get("username") if isinstance(user, dict) else getattr(user, "username", None),
+        "email": user.get("email") if isinstance(user, dict) else getattr(user, "email", None),
+        "full_name": user.get("full_name") if isinstance(user, dict) else getattr(user, "full_name", None),
+        "role": user.get("role", "").upper() if isinstance(user, dict) else getattr(user, "role", "").upper(),
+        "is_active": user.get("is_active") if isinstance(user, dict) else getattr(user, "is_active", None),
+        "is_verified": user.get("is_verified") if isinstance(user, dict) else getattr(user, "is_verified", None),
+        "avatar": user.get("avatar") if isinstance(user, dict) else getattr(user, "avatar", None),
+        # Add other fields as needed
+    }
+
+@app.get("/api/users/{username}", response_model=UserOut, tags=["User Management"])
+async def get_user_profile(username: str, current_user: UserInDB = Depends(get_current_active_user)):
+    ensure_db()
+    if not username or username == "undefined":
+        raise HTTPException(status_code=400, detail="Username is required.")
     if current_user.username != username and current_user.role != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Not authorized to view this user")
-    try:
-        user = db.users.find_one({"username": username})
-        if not user:
-            return JSONResponse(status_code=404, content={"error": "User not found"})
-        return JSONResponse(status_code=200, content=UserInDB(**user).dict())
-    except Exception:
-        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+    user = db.users.find_one({"username": username})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user_data = serialize_user(user)
+    return user_data
 
-@app.put("/api/users/{username}", response_model=UserInDB, tags=["User Management"])
-async def update_user(username: str, update: dict, current_user: UserInDB = Depends(get_current_admin_user)):
-    """Update user info (admin only)."""
-    result = db.users.find_one_and_update({"username": username}, {"$set": update}, return_document=True)
+@app.put("/api/users/{username}")
+async def update_user_profile(username: str, update: dict, current_user: UserInDB = Depends(get_current_active_user)):
+    ensure_db()
+    if not username or username == "undefined":
+        raise HTTPException(status_code=400, detail="Username is required.")
+    if current_user.username != username and current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized")
+    allowed_fields = {"full_name", "avatar", "email"}
+    update_fields = {k: v for k, v in update.items() if k in allowed_fields}
+    if not update_fields:
+        raise HTTPException(status_code=400, detail="No valid fields to update.")
+    result = db.users.find_one_and_update(
+        {"username": username},
+        {"$set": update_fields},
+        return_document=True
+    )
     if not result:
         raise HTTPException(status_code=404, detail="User not found")
-    return UserInDB(**result)
+    return {"success": True, "user": result}
 
 @app.delete("/api/users/{username}", tags=["User Management"])
 async def delete_user(username: str, current_user: UserInDB = Depends(get_current_admin_user)):
@@ -824,7 +966,7 @@ async def search_messages(
         "total_pages": (total + page_size - 1) // page_size
     }
 
-@app.post("/api/token", response_model=Token)
+@app.post("/api/token")
 async def login_for_access_token(
     form_data: OAuth2PasswordRequestForm = Depends(),
     remember_me: bool = False
@@ -855,11 +997,11 @@ async def login_for_access_token(
                 content={"error": "Invalid credentials"}
             )
             
-        user = UserInDB(**user)
+        user_obj = UserInDB(**user)
         print("UserInDB loaded")
         
         # Verify password
-        if not verify_password(form_data.password, user.hashed_password):
+        if not verify_password(form_data.password, user_obj.hashed_password):
             print("Password verification failed")
             return JSONResponse(
                 status_code=401,
@@ -868,7 +1010,7 @@ async def login_for_access_token(
         print("Password verified")
         
         # Check if user is active
-        if not user.is_active:
+        if not user_obj.is_active:
             print("User is not active")
             return JSONResponse(
                 status_code=401,
@@ -876,7 +1018,7 @@ async def login_for_access_token(
             )
             
         # Check if email is verified
-        if not user.is_verified:
+        if not user_obj.is_verified:
             print("User email not verified")
             return JSONResponse(
                 status_code=401,
@@ -889,24 +1031,26 @@ async def login_for_access_token(
         if remember_me:
             access_token_expires = timedelta(days=7)  # Longer expiry for "remember me"
         access_token = create_access_token(
-            data={"sub": user.username, "role": user.role},
+            data={"sub": user_obj.username, "role": user_obj.role},
             expires_delta=access_token_expires
         )
         print("Access token created")
         
         # Create refresh token
-        refresh_token = create_refresh_token(user.username)
+        refresh_token = create_refresh_token(user_obj.username)
         print("Refresh token created")
         
         # Store refresh token
-        await add_refresh_token(user.username, refresh_token)
+        await add_refresh_token(user_obj.username, refresh_token)
         print("Refresh token stored")
         
+        user_data = serialize_user(user)
         return {
             "access_token": access_token,
             "refresh_token": refresh_token,
-            "username": user.username,
-            "token_type": "bearer"
+            "username": user_obj.username,
+            "token_type": "bearer",
+            "user": user_data
         }
         
     except Exception as e:
@@ -918,25 +1062,20 @@ async def login_for_access_token(
             content={"success": False, "error": f"Internal Server Error: {str(e)}"}
         )
 
-@app.get("/api/auth/verify")
+@app.get("/api/auth/verify", response_model=UserOut)
 async def verify_auth(current_user: UserInDB = Depends(get_current_active_user)):
     """
     Verify if the current user is authenticated.
     Returns user information if authenticated.
     """
-    return {
-        "username": current_user.username,
-        "email": current_user.email,
-        "role": current_user.role,
-        "is_active": current_user.is_active,
-        "is_verified": current_user.is_verified
-    }
+    return serialize_user(current_user)
 
 @app.post("/api/register")
 async def register_user(
     user: UserCreate = Body(...)
 ):
     try:
+        ensure_db()
         # Check for duplicate username or email
         if db.users.find_one({"$or": [{"username": user.username}, {"email": user.email}]}):
             return JSONResponse(
@@ -945,8 +1084,8 @@ async def register_user(
             )
         # Hash the password
         hashed_password = get_password_hash(user.password)
-        # Default role to 'user' if not provided
-        role = user.role if user.role else UserRole.USER
+        # Always set role to 'user' for public registration
+        role = "user"
         # Generate confirmation token
         confirmation_token = generate_token(48)
         # Create user document
@@ -966,7 +1105,7 @@ async def register_user(
         await send_verification_email(user.email, confirmation_token)
         return JSONResponse(
             status_code=201,
-            content={"success": True, "message": "Registration successful. Please check your email to confirm your account."}
+            content={"success": True, "message": "Registration successful. Please check your email to confirm your account.", "user": serialize_user(user_doc)}
         )
     except Exception as e:
         return JSONResponse(
@@ -997,55 +1136,52 @@ async def proxy_media(url: str):
         return Response(status_code=r.status_code)
     return StreamingResponse(r.raw, media_type=r.headers.get("Content-Type")) 
 
-@app.post("/api/groups/{group_id}/participants", response_model=Participant)
-async def add_group_participant(
+@app.post("/api/groups/{group_id}/participants", tags=["Group Management"])
+async def add_group_participant_protected(
     group_id: str,
-    participant: ParticipantCreate,
+    participant: ParticipantAddRequest,
     current_user: UserInDB = Depends(get_current_active_user)
 ):
-    """
-    Add a new participant to a WhatsApp group.
-    Only active users can add participants.
-    """
-    try:
-        # Verify group exists
-        group = db.groups.find_one({"group_sid": group_id})
-        if not group:
-            raise HTTPException(status_code=404, detail="Group not found")
-
-        # Check if participant already exists
-        existing_participant = db.group_participants.find_one({
-            "group_id": group_id,
-            "phone_number": participant.phone_number
-        })
-        if existing_participant:
-            raise HTTPException(
-                status_code=400,
-                detail="Participant already exists in this group"
-            )
-
-        # Create participant document
-        participant_doc = Participant(
-            group_id=group_id,
-            phone_number=participant.phone_number,
-            name=participant.name,
-            role=participant.role
-        ).dict()
-        # Ensure 'added_at' and 'is_active' are set
-        participant_doc["added_at"] = datetime.now().isoformat()
-        participant_doc["is_active"] = True
-        # Insert into database
-        result = db.group_participants.insert_one(participant_doc)
-        
-        # Get the created participant
-        created_participant = db.group_participants.find_one({"_id": result.inserted_id})
-        
-        return Participant(**created_participant)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    ensure_db()
+    # Check if current user is admin
+    is_admin = current_user.role == "admin"
+    # Or if current user is a leader in this group
+    is_leader = db.group_participants.find_one({
+        "group_id": group_id,
+        "$or": [
+            {"user_id": current_user.username},
+            {"phone_number": current_user.username}
+        ],
+        "role": "leader",
+        "is_active": True
+    })
+    if not (is_admin or is_leader):
+        raise HTTPException(status_code=403, detail="Only admin or group leader can add participants.")
+    # Validate role
+    if participant.role not in ["team", "client", "leader"]:
+        raise HTTPException(status_code=400, detail="Role must be 'team', 'client', or 'leader'")
+    # Check if participant already exists
+    existing = db.group_participants.find_one({
+        "group_id": group_id,
+        "$or": [
+            {"user_id": participant.user_id},
+            {"phone_number": participant.user_id}
+        ]
+    })
+    if existing:
+        raise HTTPException(status_code=400, detail="Participant already exists in this group")
+    # Insert participant
+    participant_doc = {
+        "group_id": group_id,
+        "user_id": participant.user_id,
+        "phone_number": participant.user_id,  # for compatibility
+        "name": participant.name,
+        "role": participant.role,
+        "added_at": datetime.now().isoformat(),
+        "is_active": True
+    }
+    db.group_participants.insert_one(participant_doc)
+    return {"success": True, "message": f"Participant {participant.name} added as {participant.role}."}
 
 @app.get("/api/groups/{group_id}/participants", response_model=List[Participant])
 async def get_group_participants(
@@ -1056,6 +1192,7 @@ async def get_group_participants(
     Get all participants for a specific group.
     """
     try:
+        ensure_db()
         # Verify group exists
         group = db.groups.find_one({"group_sid": group_id})
         if not group:
@@ -1072,8 +1209,16 @@ async def get_group_participants(
                 p["added_at"] = datetime.now().isoformat()
             elif isinstance(p["added_at"], datetime):
                 p["added_at"] = p["added_at"].isoformat()
+            # Map group role to display role
+            if p.get("role") == "leader":
+                p["display_role"] = "Team Leader"
+            elif p.get("role") == "team":
+                p["display_role"] = "Team Member"
+            elif p.get("role") == "client":
+                p["display_role"] = "Client"
+            else:
+                p["display_role"] = p.get("role", "Unknown")
         return [Participant(**p) for p in participants]
-
     except HTTPException:
         raise
     except Exception as e:
@@ -1124,55 +1269,55 @@ groq_client = groq.Client(api_key=os.getenv("GROQ_API_KEY"))
 async def generate_contextual_reply(group_id: str, num_messages: int = 5) -> Dict:
     """
     Generate a contextual reply based on recent messages in a group.
-    
-    Args:
-        group_id: The WhatsApp group ID
-        num_messages: Number of recent messages to consider for context
-        
-    Returns:
-        Dict containing the generated reply and metadata
     """
     try:
         # Fetch recent messages
         recent_messages = list(db.messages.find(
             {"group_id": group_id}
         ).sort("timestamp", -1).limit(num_messages))
-        
         if not recent_messages:
             return None
-            
         # Format messages for context
         context = "\n".join([
             f"{msg['sender']}: {msg['body']}"
             for msg in reversed(recent_messages)
         ])
-        
-        # Create prompt for Groq
-        prompt = f"""Based on the following WhatsApp conversation, generate a helpful and contextual response.
-        The response should be professional, concise, and address any questions or concerns raised.
-        
-        Recent messages:
-        {context}
-        
-        Generate a response:"""
-        
-        # Call Groq API
-        completion = groq_client.chat.completions.create(
-            model="mixtral-8x7b-32768",  # or another appropriate model
-            messages=[
-                {"role": "system", "content": "You are a helpful customer service assistant."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-            max_tokens=150
-        )
-        
-        reply_text = completion.choices[0].message.content.strip()
-        
+        # Use prompt from ai_prompts.py
+        prompt = contextual_reply_user_prompt.format(context=context)
+        try:
+            # Call Groq API
+            completion = groq_client.chat.completions.create(
+                model="mixtral-8x7b-32768",
+                messages=[
+                    {"role": "system", "content": contextual_reply_system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.7,
+                max_tokens=150
+            )
+            reply_text = completion.choices[0].message.content.strip()
+        except Exception as e:
+            print(f"Error generating contextual reply: {str(e)}")
+            reply_text = ""
+        if not reply_text:
+            # Fallback auto-reply
+            fallback_reply = {
+                "group_id": group_id,
+                "client_number": recent_messages[0]["sender"],
+                "reason": "contextual",
+                "reply_text": "We'll get back to you shortly.",
+                "timestamp": datetime.now(),
+                "generated_by": "fallback",
+                "reviewed": False,
+                "context_messages": [str(msg["_id"]) for msg in recent_messages]
+            }
+            result = db.auto_replies.insert_one(fallback_reply)
+            fallback_reply["_id"] = result.inserted_id
+            return fallback_reply
         # Create auto-reply document
         auto_reply = {
             "group_id": group_id,
-            "client_number": recent_messages[0]["sender"],  # Reply to the most recent message
+            "client_number": recent_messages[0]["sender"],
             "reason": "contextual",
             "reply_text": reply_text,
             "timestamp": datetime.now(),
@@ -1180,13 +1325,10 @@ async def generate_contextual_reply(group_id: str, num_messages: int = 5) -> Dic
             "reviewed": True,
             "context_messages": [str(msg["_id"]) for msg in recent_messages]
         }
-        
         # Store in auto_replies collection
         result = db.auto_replies.insert_one(auto_reply)
         auto_reply["_id"] = result.inserted_id
-        
         return auto_reply
-        
     except Exception as e:
         print(f"Error generating contextual reply: {str(e)}")
         return None
@@ -1570,3 +1712,175 @@ async def get_contact_history(phone_number: str, skip: int = 0, limit: int = 100
     for msg in messages:
         msg["_id"] = str(msg["_id"])
     return {"messages": messages} 
+
+class AdminUserCreate(BaseModel):
+    full_name: str
+    username: str
+    email: EmailStr
+    password: str
+    role: str  # 'user' or 'admin'
+
+@app.post("/api/users", tags=["User Management"])
+async def admin_create_user(
+    user: AdminUserCreate,
+    current_user: UserInDB = Depends(get_current_admin_user)
+):
+    ensure_db()
+    if user.role not in ["user", "admin"]:
+        raise HTTPException(status_code=400, detail="Role must be 'user' or 'admin'")
+    if db.users.find_one({"$or": [{"username": user.username}, {"email": user.email}]}):
+        raise HTTPException(status_code=409, detail="Username or email already exists")
+    hashed_password = get_password_hash(user.password)
+    confirmation_token = generate_token(48)
+    user_doc = {
+        "username": user.username,
+        "email": user.email,
+        "hashed_password": hashed_password,
+        "full_name": user.full_name,
+        "role": user.role,
+        "is_active": True,
+        "is_verified": False,
+        "verification_token": confirmation_token,
+        "refresh_tokens": []
+    }
+    db.users.insert_one(user_doc)
+    await send_verification_email(user.email, confirmation_token)
+    return {"success": True, "message": f"User {user.username} created with role {user.role}."} 
+
+@app.put("/api/groups/{group_id}/participants/{user_id}/role", tags=["Group Management"])
+async def update_participant_role(
+    group_id: str,
+    user_id: str,
+    role_update: ParticipantRoleUpdateRequest,
+    current_user: UserInDB = Depends(get_current_active_user)
+):
+    ensure_db()
+    # Check if current user is admin
+    is_admin = current_user.role == "admin"
+    # Or if current user is a leader in this group
+    is_leader = db.group_participants.find_one({
+        "group_id": group_id,
+        "$or": [
+            {"user_id": current_user.username},
+            {"phone_number": current_user.username}
+        ],
+        "role": "leader",
+        "is_active": True
+    })
+    if not (is_admin or is_leader):
+        raise HTTPException(status_code=403, detail="Only admin or group leader can change participant roles.")
+    if role_update.new_role not in ["team", "client", "leader"]:
+        raise HTTPException(status_code=400, detail="Role must be 'team', 'client', or 'leader'")
+    result = db.group_participants.update_one(
+        {"group_id": group_id, "$or": [{"user_id": user_id}, {"phone_number": user_id}]},
+        {"$set": {"role": role_update.new_role}}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Participant not found")
+    return {"success": True, "message": f"Role updated to {role_update.new_role}"} 
+
+@app.post("/api/users/{username}/avatar")
+async def upload_user_avatar(username: str, avatar: UploadFile = File(...), current_user: UserInDB = Depends(get_current_active_user)):
+    ensure_db()
+    if not username or username == "undefined":
+        raise HTTPException(status_code=400, detail="Username is required.")
+    if current_user.username != username and current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized")
+    upload_dir = "uploads/avatars"
+    os.makedirs(upload_dir, exist_ok=True)
+    ext = avatar.filename.split('.')[-1]
+    avatar_filename = f"{username}.{ext}"
+    avatar_path = os.path.join(upload_dir, avatar_filename)
+    with open(avatar_path, "wb") as buffer:
+        shutil.copyfileobj(avatar.file, buffer)
+    avatar_url = f"/uploads/avatars/{avatar_filename}"
+    db.users.update_one({"username": username}, {"$set": {"avatar": avatar_url}})
+    return {"avatar": avatar_url}
+
+# Method Not Allowed handler for unsupported methods on /api/users/{username} and /api/users/{username}/avatar
+@app.api_route("/api/users/{username}", methods=["POST", "PATCH", "DELETE"])
+@app.api_route("/api/users/{username}/avatar", methods=["PUT", "PATCH", "DELETE"])
+async def method_not_allowed(request: Request, username: str):
+    return JSONResponse(status_code=405, content={"detail": "Method Not Allowed"}) 
+
+@app.get("/api/company_holidays")
+async def get_company_holidays(current_user: UserInDB = Depends(get_current_active_user)):
+    ensure_db()
+    holidays = list(db.company_holidays.find())
+    def format_date(iso_date):
+        try:
+            d = datetime.strptime(iso_date, "%Y-%m-%d")
+            return d.strftime("%d/%m/%Y")
+        except Exception:
+            return iso_date
+    return [{
+        "id": str(h["_id"]),
+        "date": format_date(h["date"]),
+        "description": h.get("description", "")
+    } for h in holidays]
+
+@app.post("/api/company_holidays")
+async def add_company_holiday(
+    holiday: HolidayCreateRequest,
+    current_user: UserInDB = Depends(get_current_admin_user)
+):
+    ensure_db()
+    # Validate date format (accepts YYYY-MM-DD or dd/mm/yyyy)
+    iso_date = holiday.date
+    if re.match(r"^\d{2}/\d{2}/\d{4}$", iso_date):
+        try:
+            iso_date = datetime.strptime(iso_date, "%d/%m/%Y").strftime("%Y-%m-%d")
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid date format.")
+    elif not re.match(r"^\d{4}-\d{2}-\d{2}$", iso_date):
+        raise HTTPException(status_code=400, detail="Date must be in YYYY-MM-DD or dd/mm/yyyy format.")
+    # Prevent duplicates
+    if db.company_holidays.find_one({"date": iso_date}):
+        raise HTTPException(status_code=400, detail="Holiday already exists.")
+    result = db.company_holidays.insert_one({"date": iso_date, "description": holiday.description or ""})
+    return {"id": str(result.inserted_id), "date": iso_date, "description": holiday.description or ""}
+
+@app.delete("/api/company_holidays/{id}")
+async def delete_company_holiday(id: str, current_user: UserInDB = Depends(get_current_admin_user)):
+    ensure_db()
+    try:
+        result = db.company_holidays.delete_one({"_id": ObjectId(id)})
+        if result.deleted_count == 0:
+            raise HTTPException(status_code=404, detail="Holiday not found.")
+        return Response(status_code=204)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid holiday id.") 
+
+@app.get("/api/company_working_hours")
+async def get_company_working_hours(current_user: UserInDB = Depends(get_current_active_user)):
+    ensure_db()
+    wh = db.company_working_hours.find_one()
+    if wh:
+        return {"start": wh["start"], "end": wh["end"]}
+    return {"start": "09:00", "end": "18:00"}  # Default
+
+@app.post("/api/company_working_hours")
+async def set_company_working_hours(
+    req: WorkingHoursRequest,
+    current_user: UserInDB = Depends(get_current_admin_user)
+):
+    ensure_db()
+    # Validate format
+    if not re.match(r"^\d{2}:\d{2}$", req.start) or not re.match(r"^\d{2}:\d{2}$", req.end):
+        raise HTTPException(status_code=400, detail="Time must be in HH:MM format.")
+    db.company_working_hours.delete_many({})  # Only one config
+    db.company_working_hours.insert_one({"start": req.start, "end": req.end})
+    return {"start": req.start, "end": req.end} 
+
+@app.patch("/api/company_holidays/{id}")
+async def update_company_holiday_description(
+    id: str = Path(...),
+    payload: dict = Body(...),
+    current_user: UserInDB = Depends(get_current_admin_user)
+):
+    ensure_db()
+    desc = payload.get("description", "")
+    result = db.company_holidays.update_one({"_id": ObjectId(id)}, {"$set": {"description": desc}})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Holiday not found.")
+    return {"id": id, "description": desc} 

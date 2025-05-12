@@ -7,6 +7,7 @@ from pymongo import MongoClient
 from dotenv import load_dotenv
 import magic
 from datetime import datetime
+from ai_prompts import keyword_summary_prompt, text_summary_prompt
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -28,7 +29,7 @@ def process_text_with_groq(text: str) -> Dict:
     try:
         response = get_groq_client().chat.completions.create(
             messages=[
-                {"role": "system", "content": "You are a helpful assistant that extracts keywords and generates concise summaries."},
+                {"role": "system", "content": keyword_summary_prompt},
                 {"role": "user", "content": f"Extract key keywords and generate a summary for this text: {text}"}
             ],
             model="mixtral-8x7b-32768",
@@ -49,7 +50,7 @@ def summarize_text(text: str) -> str:
     try:
         response = get_groq_client().chat.completions.create(
             messages=[
-                {"role": "system", "content": "You are a helpful assistant that summarizes text."},
+                {"role": "system", "content": text_summary_prompt},
                 {"role": "user", "content": f"Summarize this text: {text}"}
             ],
             model="mixtral-8x7b-32768",

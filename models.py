@@ -95,4 +95,13 @@ class Message(BaseModel):
         "ignored": False,
         "notified_at": None,
         "auto_replied": False
-    }) 
+    })
+
+class UserOut(BaseModel):
+    username: str
+    email: EmailStr
+    full_name: Optional[str] = None
+    role: str
+    is_active: bool
+    is_verified: bool
+    avatar: Optional[str] = None 
