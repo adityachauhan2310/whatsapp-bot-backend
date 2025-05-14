@@ -9,15 +9,24 @@ from models import UserRole
 import os
 import secrets
 import string
-from pymongo import MongoClient
+from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
+import certifi
+from fastapi.responses import JSONResponse
+import traceback
+import logging
 
 # Load environment variables
 load_dotenv()
 
-# MongoDB connection
-client = MongoClient(os.getenv("MONGODB_URI"))
-db = client[os.getenv("MONGODB_DB")]
+# MongoDB connection - properly initialized with SSL support
+try:
+    client = AsyncIOMotorClient(os.getenv("MONGODB_URI"))
+    db = client[os.getenv("MONGODB_DB")]
+    print("Auth module connected to MongoDB")
+except Exception as e:
+    print(f"Error connecting to MongoDB in auth.py: {str(e)}")
+    # We'll continue and let the app handle reconnection logic
 
 # JWT Configuration
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-secret-key-here")  # Change this in production
@@ -73,7 +82,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     if expires_delta:
         expire = datetime.utcnow() + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=15)
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
@@ -96,10 +105,10 @@ async def send_verification_email(email: str, token: str):
     print(f"To: {email}\nSubject: {subject}\nBody: {body}")
 
 async def verify_email(token: str):
-    user = db.users.find_one({"verification_token": token})
+    user = await db.users.find_one({"verification_token": token})
     if not user:
         raise HTTPException(status_code=400, detail="Invalid or expired verification token")
-    db.users.update_one({"_id": user["_id"]}, {"$set": {"is_verified": True, "verification_token": None}})
+    await db.users.update_one({"_id": user["_id"]}, {"$set": {"is_verified": True, "verification_token": None}})
     return {"message": "Email verified successfully."}
 
 # Password reset
@@ -108,19 +117,238 @@ async def send_reset_email(email: str, token: str):
     print(f"Send password reset email to {email} with token: {token}")
 
 async def reset_password(token: str, new_password: str):
-    user = db.users.find_one({"reset_token": token})
+    user = await db.users.find_one({"reset_token": token})
     if not user:
         raise HTTPException(status_code=400, detail="Invalid or expired reset token")
     hashed = get_password_hash(new_password)
-    db.users.update_one({"_id": user["_id"]}, {"$set": {"hashed_password": hashed, "reset_token": None}})
+    await db.users.update_one({"_id": user["_id"]}, {"$set": {"hashed_password": hashed, "reset_token": None}})
     return {"message": "Password reset successful."}
 
 # Session management
 async def add_refresh_token(username: str, refresh_token: str):
-    db.users.update_one({"username": username}, {"$push": {"refresh_tokens": refresh_token}})
+    await db.users.update_one({"username": username}, {"$push": {"refresh_tokens": refresh_token}})
 
 async def remove_refresh_token(username: str, refresh_token: str):
-    db.users.update_one({"username": username}, {"$pull": {"refresh_tokens": refresh_token}})
+    await db.users.update_one({"username": username}, {"$pull": {"refresh_tokens": refresh_token}})
+
+# Login functions
+async def login_for_access_token(
+    request: Request, form_data: OAuth2PasswordRequestForm = Depends()
+):
+    """OAuth2 compatible token login, get an access token for future requests."""
+    print("/api/token called")
+    print("form_data.username:", form_data.username)
+
+    # Get remember_me from form data
+    try:
+        body = await request.json()
+        remember_me = body.get("remember_me", False)
+    except:
+        remember_me = False
+
+    print("remember_me:", remember_me)
+
+    try:
+        # Check database connection
+        if db is None:
+            return JSONResponse(
+                status_code=503,
+                content={"success": False, "error": "Database connection is not available"}
+            )
+
+        # Try to find user by username or email
+        user = await db.users.find_one({
+            "$or": [
+                {"username": form_data.username},
+                {"email": form_data.username}
+            ]
+        })
+        
+        if not user:
+            return JSONResponse(
+                status_code=401,
+                content={"success": False, "error": "Invalid credentials"}
+            )
+            
+        # Convert to UserInDB model
+        try:
+            user_obj = UserInDB(**user)
+        except Exception as e:
+            return JSONResponse(
+                status_code=500,
+                content={"success": False, "error": f"Error parsing user data: {str(e)}"}
+            )
+        
+        # Verify password
+        if not verify_password(form_data.password, user_obj.hashed_password):
+            return JSONResponse(
+                status_code=401,
+                content={"success": False, "error": "Invalid credentials"}
+            )
+        
+        # Check if user is active
+        if not user_obj.is_active:
+            return JSONResponse(
+                status_code=401,
+                content={"success": False, "error": "Inactive user"}
+            )
+            
+        # Check if email is verified
+        if not user_obj.is_verified:
+            return JSONResponse(
+                status_code=401,
+                content={"success": False, "error": "Please confirm your email before logging in."}
+            )
+        
+        # Create access token
+        try:
+            access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+            if remember_me:
+                access_token_expires = timedelta(days=7)  # Longer expiry for "remember me"
+            access_token = create_access_token(
+                data={"sub": user_obj.username, "role": user_obj.role},
+                expires_delta=access_token_expires
+            )
+            
+            # Create refresh token
+            refresh_token = create_refresh_token(user_obj.username)
+            
+            # Store refresh token
+            await add_refresh_token(user_obj.username, refresh_token)
+            
+            # Prepare user data for response
+            user_data = serialize_user(user)
+            
+            return {
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "username": user_obj.username,
+                "token_type": "bearer",
+                "user": user_data
+            }
+        except Exception as e:
+            return JSONResponse(
+                status_code=500,
+                content={"success": False, "error": f"Token creation error: {str(e)}"}
+            )
+    except Exception as e:
+        tb = traceback.format_exc()
+        logger.error(f"Exception in login_for_access_token: {tb}")
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": f"Internal Server Error: {str(e)}"}
+        )
+
+async def login_json(request: Request):
+    """
+    Login endpoint that accepts JSON data from the login form.
+    """
+    try:
+        # Parse the JSON body from the request
+        body = await request.json()
+        username = body.get("username") or body.get("email")
+        password = body.get("password")
+        remember_me = body.get("remember_me", False)
+        
+        if not username or not password:
+            return JSONResponse(
+                status_code=400,
+                content={"success": False, "error": "Username and password are required"}
+            )
+            
+        # Check database connection
+        if db is None:
+            return JSONResponse(
+                status_code=503,
+                content={"success": False, "error": "Database connection is not available"}
+            )
+            
+        # Try to find user by username or email
+        user = await db.users.find_one({
+            "$or": [
+                {"username": username},
+                {"email": username}
+            ]
+        })
+        
+        if not user:
+            return JSONResponse(
+                status_code=401,
+                content={"success": False, "error": "Invalid credentials"}
+            )
+            
+        # Convert to UserInDB model
+        try:
+            user_obj = UserInDB(**user)
+        except Exception as e:
+            return JSONResponse(
+                status_code=500,
+                content={"success": False, "error": f"Error parsing user data: {str(e)}"}
+            )
+        
+        # Verify password
+        if not verify_password(password, user_obj.hashed_password):
+            return JSONResponse(
+                status_code=401,
+                content={"success": False, "error": "Invalid credentials"}
+            )
+        
+        # Check if user is active
+        if not user_obj.is_active:
+            return JSONResponse(
+                status_code=401,
+                content={"success": False, "error": "Inactive user"}
+            )
+            
+        # Check if email is verified
+        if not user_obj.is_verified:
+            return JSONResponse(
+                status_code=401,
+                content={"success": False, "error": "Please confirm your email before logging in."}
+            )
+        
+        # Create access token
+        try:
+            access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+            if remember_me:
+                access_token_expires = timedelta(days=7)  # Longer expiry for "remember me"
+            access_token = create_access_token(
+                data={"sub": user_obj.username, "role": user_obj.role},
+                expires_delta=access_token_expires
+            )
+            
+            # Create refresh token
+            refresh_token = create_refresh_token(user_obj.username)
+            
+            # Store refresh token
+            await add_refresh_token(user_obj.username, refresh_token)
+            
+            # Prepare user data for response
+            user_data = serialize_user(user)
+            
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "success": True,
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                    "token_type": "bearer",
+                    "username": user_obj.username,
+                    "user": user_data
+                }
+            )
+        except Exception as e:
+            return JSONResponse(
+                status_code=500,
+                content={"success": False, "error": f"Token creation error: {str(e)}"}
+            )
+    except Exception as e:
+        tb = traceback.format_exc()
+        logger.error(f"Exception in login_json: {tb}")
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": f"Internal Server Error: {str(e)}"}
+        )
 
 # Role-based permission checks
 async def get_current_user(token: str = Depends(oauth2_scheme)) -> UserInDB:
@@ -138,7 +366,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> UserInDB:
         token_data = TokenData(username=username, role=role)
     except JWTError:
         raise credentials_exception
-    user = db.users.find_one({"username": token_data.username})
+    user = await db.users.find_one({"username": token_data.username})
     if not user:
         raise credentials_exception
     return UserInDB(**user)

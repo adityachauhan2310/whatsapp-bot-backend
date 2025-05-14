@@ -9,6 +9,7 @@ from groq import Groq
 from dotenv import load_dotenv
 import requests
 import time
+import certifi
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -18,7 +19,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # Initialize MongoDB client
-client = MongoClient(os.getenv("MONGODB_URI"))
+client = MongoClient(os.getenv("MONGODB_URI"), tlsCAFile=certifi.where())
 db = client[os.getenv("MONGODB_DB")]
 
 # Initialize Groq client

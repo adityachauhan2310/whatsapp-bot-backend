@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 import magic
 from datetime import datetime
 from ai_prompts import keyword_summary_prompt, text_summary_prompt
+import certifi
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -17,12 +18,12 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # MongoDB connection
-client = MongoClient(os.getenv("MONGODB_URI"))
+client = MongoClient(os.getenv("MONGODB_URI"), tlsCAFile=certifi.where())
 db = client[os.getenv("MONGODB_DB")]
 
 def get_groq_client():
-    from groq import Groq
-    return Groq(api_key=os.getenv("GROQ_API_KEY"))
+    import groq
+    return groq.Client(api_key=os.getenv("GROQ_API_KEY"))
 
 def process_text_with_groq(text: str) -> Dict:
     """Process text using Groq API to extract keywords and generate summary."""

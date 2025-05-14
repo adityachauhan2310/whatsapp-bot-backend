@@ -2,6 +2,7 @@ fastapi==0.109.2
 uvicorn==0.27.1
 python-multipart==0.0.9
 pymongo==4.6.1
+motor==3.3.2  # Async MongoDB driver for FastAPI (required!)
 python-dotenv==1.0.1
 requests==2.31.0
 twilio==8.12.0
@@ -9,7 +10,10 @@ groq==0.4.2
 python-magic-bin==0.4.14
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
-python-multipart==0.0.9
 email-validator==2.1.0.post1
 apscheduler==3.10.4 
 holidays==0.25
+
+# If you have trouble installing motor on Windows, try:
+# pip install --index-url https://pypi.org/simple/ motor
+# or use a different network/PyPI mirror
