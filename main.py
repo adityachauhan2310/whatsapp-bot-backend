@@ -510,7 +510,7 @@ async def create_group(
             keywords=group.keywords or [],
             notification_settings=group.notification_settings or {},
         )
-
+        
         db.groups.insert_one(group_config.dict())
         return group_config
     except Exception as e:
@@ -521,7 +521,7 @@ async def create_group(
 async def list_groups():
     cursor = db.groups.find()
     groups = await cursor.to_list(length=100)
-    return [GroupConfig(**group) for group in groups]
+        return [GroupConfig(**group) for group in groups]
 
 
 @app.get("/api/groups/{group_sid}", response_model=GroupConfig)
@@ -550,7 +550,7 @@ async def update_group(group_sid: str, group_update: GroupUpdate):
             raise HTTPException(status_code=400,
                                 detail="No update data provided")
         result = db.groups.find_one_and_update({"group_sid": group_sid},
-                                               {"$set": update_data},
+            {"$set": update_data},
                                                return_document=True)
         if not result:
             raise HTTPException(status_code=404, detail="Group not found")
@@ -583,7 +583,7 @@ async def get_group_stats(group_sid: str):
         # Get total messages
         total_messages = await db.processed_messages.count_documents(
             {"group_sid": group_sid})
-
+        
         # Get message type distribution
         message_types_pipeline = [{
             "$match": {
@@ -604,23 +604,23 @@ async def get_group_stats(group_sid: str):
             doc["_id"]: doc["count"]
             for doc in message_types_result
         }
-
+        
         # Get unique active users
         distinct_cursor = db.processed_messages.distinct(
             "from", {"group_sid": group_sid})
         active_users_list = await distinct_cursor
         active_users = len(active_users_list)
-
+        
         # Get last activity
         last_message = await db.processed_messages.find_one(
             {"group_sid": group_sid}, sort=[("timestamp", DESCENDING)])
         last_activity = (datetime.fromtimestamp(last_message["timestamp"])
                          if last_message else None)
-
+        
         # Get keywords (from group config)
         group = await db.groups.find_one({"group_sid": group_sid})
         keywords = group.get("keywords", []) if group else []
-
+        
         return GroupStats(
             total_messages=total_messages,
             message_types=message_type_dist,
@@ -636,7 +636,7 @@ async def get_group_stats(group_sid: str):
 
 @app.get("/api/messages/processed")
 async def get_processed_messages_endpoint(
-        filters: FilterParams = Depends(),
+    filters: FilterParams = Depends(),
         pagination: PaginationParams = Depends()):
     ensure_db()
     try:
@@ -779,10 +779,10 @@ async def search_summaries(request: SearchRequest):
         if not request.keyword.strip():
             raise HTTPException(status_code=400,
                                 detail="Keyword cannot be empty")
-
+            
         # Simulate a small delay
         time.sleep(0.8)
-
+        
         # Mock search results
         results = [
             {
@@ -802,7 +802,7 @@ async def search_summaries(request: SearchRequest):
                 "relevance_score": 0.85,
             },
         ]
-
+        
         return {"results": results}
     except HTTPException:
         raise
@@ -849,7 +849,7 @@ async def summarize_text_endpoint(request: TextRequest):
     try:
         if not request.text.strip():
             raise HTTPException(status_code=400, detail="Text cannot be empty")
-
+            
         summary = summarize_text(request.text)
         return {"summary": summary}
     except HTTPException:
@@ -1040,7 +1040,7 @@ async def startup_event():
 
     # Create test admin user
     await create_test_admin()
-
+    
     # Add the message escalation job
     scheduler.add_job(
         check_message_escalation,
@@ -1048,7 +1048,7 @@ async def startup_event():
         id="message_escalation",
         replace_existing=True,
     )
-
+    
     # Setup other scheduled tasks
     setup_scheduled_tasks()
 
@@ -1249,7 +1249,7 @@ async def toggle_user_status(
         # Find user
         user = db.users.find_one({"username": user_id})
         if not user:
-            raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail="User not found")
 
         # Toggle status
         new_status = not user.get("is_active", True)
@@ -1280,7 +1280,7 @@ async def delete_user(
         # Check if user exists
         user = await db.users.find_one({"username": user_id})
         if not user:
-            raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail="User not found")
 
         # Delete user
         result = await db.users.delete_one({"username": user_id})
@@ -1387,7 +1387,7 @@ async def system_status(
             {"is_active": False})
         daily_summaries_count = await db.daily_summaries.count_documents({})
 
-        return {
+    return {
             "users": users_count,
             "groups": groups_count,
             "messages": messages_count,
@@ -1414,7 +1414,7 @@ async def group_analytics(group_id: str):
         last_msg = await db.processed_messages.find_one(
             {"group_sid": group_id}, sort=[("timestamp", DESCENDING)])
 
-        return {
+    return {
             "group_id":
             group_id,
             "total_messages":
@@ -1508,10 +1508,10 @@ async def get_daily_statistics(
 
 @app.get("/api/analytics/messages", tags=["Analytics"])
 async def message_analytics(
-        group_sid: Optional[str] = None,
-        start_date: Optional[datetime] = Query(None),
-        end_date: Optional[datetime] = Query(None),
-        message_type: Optional[str] = None,
+    group_sid: Optional[str] = None,
+    start_date: Optional[datetime] = Query(None),
+    end_date: Optional[datetime] = Query(None),
+    message_type: Optional[str] = None,
         current_user: UserInDB = Depends(get_current_admin_user),
 ):
     """Get message analytics with filters (admin only)."""
@@ -1783,8 +1783,8 @@ def mock_group_report(group_id: str, start_date: datetime, end_date: datetime):
     """Generate mock group analytics report for testing"""
     mock_group_name = f"Group {group_id[-4:]}" if len(
         group_id) > 4 else "Test Group"
-
-    return {
+            
+        return {
         "group_id":
         group_id,
         "group_name":
@@ -1931,7 +1931,7 @@ async def generate_summaries(
             # Skip if no activity
             if total_messages == 0:
                 results.append({
-                    "group_id": group_id,
+            "group_id": group_id,
                     "date": start_date.date().isoformat(),
                     "skipped": True,
                     "reason": "No messages in time range"
@@ -1945,7 +1945,7 @@ async def generate_summaries(
 
             # Extract message content for summarization
             message_texts = []
-            for msg in messages:
+        for msg in messages:
                 if msg.get("body"):
                     sender_prefix = f"{msg.get('from_name', 'Unknown')}: " if msg.get(
                         "from_name") else ""
@@ -1992,7 +1992,7 @@ async def generate_summaries(
                 "message_count": total_messages
             })
 
-        return {
+    return {
             "success": True,
             "date_range": {
                 "start": start_date.date().isoformat(),
