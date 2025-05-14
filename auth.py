@@ -4,7 +4,7 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr
 from fastapi import Depends, HTTPException, status, Request
-from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from models import UserRole
 import os
 import secrets
@@ -16,10 +16,15 @@ from fastapi.responses import JSONResponse
 import traceback
 import logging
 
+# Set up logging
+logger = logging.getLogger(__name__)
+
 # Load environment variables
 load_dotenv()
 
 # MongoDB connection - properly initialized with SSL support
+client = None
+db = None
 try:
     client = AsyncIOMotorClient(os.getenv("MONGODB_URI"))
     db = client[os.getenv("MONGODB_DB")]
@@ -94,6 +99,29 @@ def create_refresh_token(username: str) -> str:
 
 def generate_token(length=32):
     return ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(length))
+
+def serialize_user(user):
+    # Accepts a dict or Pydantic model
+    return {
+        "id": (user.get("username") if isinstance(user, dict) else getattr(
+            user, "username", None)),
+        "username": (user.get("username") if isinstance(user, dict) else
+                     getattr(user, "username", None)),
+        "email": (user.get("email") if isinstance(user, dict) else getattr(
+            user, "email", None)),
+        "full_name": (user.get("full_name") if isinstance(user, dict) else
+                      getattr(user, "full_name", None)),
+        "role":
+        (user.get("role", "").upper() if isinstance(user, dict) else getattr(
+            user, "role", "").upper()),
+        "is_active": (user.get("is_active") if isinstance(user, dict) else
+                      getattr(user, "is_active", None)),
+        "is_verified": (user.get("is_verified") if isinstance(user, dict) else
+                        getattr(user, "is_verified", None)),
+        "avatar": (user.get("avatar") if isinstance(user, dict) else getattr(
+            user, "avatar", None)),
+        # Add other fields as needed
+    }
 
 # Email verification
 async def send_verification_email(email: str, token: str):
@@ -219,6 +247,8 @@ async def login_for_access_token(
             # Prepare user data for response
             user_data = serialize_user(user)
             
+            print("DEBUG - Successfully created token. About to return response.")
+            
             return {
                 "access_token": access_token,
                 "refresh_token": refresh_token,
@@ -326,6 +356,8 @@ async def login_json(request: Request):
             # Prepare user data for response
             user_data = serialize_user(user)
             
+            print("DEBUG - Successfully created JSON login response. About to return.")
+            
             return JSONResponse(
                 status_code=200,
                 content={
@@ -345,6 +377,7 @@ async def login_json(request: Request):
     except Exception as e:
         tb = traceback.format_exc()
         logger.error(f"Exception in login_json: {tb}")
+        print(f"DEBUG - Error in login_json: {str(e)}\n{tb}")
         return JSONResponse(
             status_code=500,
             content={"success": False, "error": f"Internal Server Error: {str(e)}"}

@@ -75,6 +75,8 @@ from auth import (
     ACCESS_TOKEN_EXPIRE_MINUTES,
     generate_token,
     send_verification_email,
+    login_for_access_token,
+    login_json,
 )
 from scheduler import monitor, setup_scheduled_tasks
 from fastapi.security import OAuth2PasswordRequestForm
@@ -99,7 +101,6 @@ from bson import ObjectId
 import re
 import random
 import certifi
-from login_functions import login_for_access_token, login_json
 
 # Set up logging to file
 logging.basicConfig(

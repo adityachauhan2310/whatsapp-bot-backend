@@ -2,7 +2,6 @@ import os
 import asyncio
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
-import certifi
 
 # Load environment variables
 load_dotenv()
@@ -14,7 +13,7 @@ MONGODB_DB = os.getenv("MONGODB_DB")
 print(f"MONGODB_URI: {MONGODB_URI}")
 print(f"MONGODB_DB: {MONGODB_DB}")
 
-async def test_connection():
+async def list_users():
     # Set up MongoDB connection
     client = AsyncIOMotorClient(
         MONGODB_URI,
@@ -25,23 +24,22 @@ async def test_connection():
     db = client[MONGODB_DB]
     
     try:
-        # Simple ping to check connection
-        await db.command("ping")
-        print("MongoDB connection successful!")
+        # List all users
+        cursor = db.users.find({})
+        users = await cursor.to_list(length=100)
         
-        # Check if we can retrieve data
-        users_count = await db.users.count_documents({})
-        print(f"Users count: {users_count}")
-        
-        # Get one document
-        admin = await db.users.find_one({"username": "admin"})
-        if admin:
-            print(f"Found admin user: {admin.get('email')}")
-        else:
-            print("Admin user not found")
+        print(f"Found {len(users)} users:")
+        for user in users:
+            print(f"Username: {user.get('username')}")
+            print(f"  Email: {user.get('email')}")
+            print(f"  Role: {user.get('role')}")
+            print(f"  Active: {user.get('is_active')}")
+            print(f"  Verified: {user.get('is_verified')}")
+            print(f"  Hash: {user.get('hashed_password')[:20]}...")
+            print("---")
             
     except Exception as e:
-        print(f"Error testing MongoDB connection: {str(e)}")
+        print(f"Error listing users: {str(e)}")
     finally:
         # Close connection
         client.close()
@@ -49,4 +47,4 @@ async def test_connection():
 
 if __name__ == "__main__":
     # Run the async function
-    asyncio.run(test_connection()) 
+    asyncio.run(list_users()) 
