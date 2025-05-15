@@ -27,7 +27,7 @@ client = None
 db = None
 try:
     client = AsyncIOMotorClient(os.getenv("MONGODB_URI"))
-db = client[os.getenv("MONGODB_DB")]
+    db = client[os.getenv("MONGODB_DB")]
     print("Auth module connected to MongoDB")
 except Exception as e:
     print(f"Error connecting to MongoDB in auth.py: {str(e)}")

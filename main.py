@@ -101,6 +101,7 @@ from bson import ObjectId
 import re
 import random
 import certifi
+import asyncio
 
 # Set up logging to file
 logging.basicConfig(
@@ -246,9 +247,9 @@ class LoginRequest(BaseModel):
 # Background task to process incoming messages
 async def process_incoming_message(message_data: Dict):
     # Simulate processing delay
-    time.sleep(1)
+    await asyncio.sleep(1)
     # Store message in MongoDB
-    db.messages.insert_one(message_data)
+    await db.messages.insert_one(message_data)
     print(f"Processed and stored message: {message_data}")
 
 
@@ -346,10 +347,10 @@ async def twilio_webhook(request: Request, background_tasks: BackgroundTasks):
         today = datetime.now().date()
         is_weekend = today.weekday() >= 5  # 5 = Saturday, 6 = Sunday
         # Query company_holidays for today
-        holiday_doc = db.company_holidays.find_one({"date": today.isoformat()})
+        holiday_doc = await db.company_holidays.find_one({"date": today.isoformat()})
         is_company_holiday = holiday_doc is not None
         # --- Working hours check ---
-        wh = db.company_working_hours.find_one()
+        wh = await db.company_working_hours.find_one()
         if wh:
             now = datetime.now().time()
             from datetime import datetime as dt
@@ -365,7 +366,7 @@ async def twilio_webhook(request: Request, background_tasks: BackgroundTasks):
                     f"Our team is available from {start.strftime('%H:%M')} to {end.strftime('%H:%M')}. We will respond to your message during working hours.",
                     "timestamp": datetime.now(),
                 }
-                db.auto_replies.insert_one(auto_reply)
+                await db.auto_replies.insert_one(auto_reply)
                 response = MessagingResponse()
                 response.message(
                     f"Thank you for your message. Our working hours are {start.strftime('%H:%M')} to {end.strftime('%H:%M')}. We will respond during business hours."
@@ -383,7 +384,7 @@ async def twilio_webhook(request: Request, background_tasks: BackgroundTasks):
                 "timestamp": datetime.now(),
             }
             # Insert into auto_replies collection
-            db.auto_replies.insert_one(auto_reply)
+            await db.auto_replies.insert_one(auto_reply)
             # Return early with a simple response
             response = MessagingResponse()
             return str(response)
@@ -402,7 +403,7 @@ async def twilio_webhook(request: Request, background_tasks: BackgroundTasks):
         ).dict()
 
         # Store message in MongoDB
-        result = db.messages.insert_one(message_doc)
+        result = await db.messages.insert_one(message_doc)
         print(f"Stored message with ID: {result.inserted_id}")
 
         # Determine message type
@@ -417,7 +418,7 @@ async def twilio_webhook(request: Request, background_tasks: BackgroundTasks):
                 message_doc["message_type"] = MessageType.MEDIA
 
             # Update message type in database
-            db.messages.update_one(
+            await db.messages.update_one(
                 {"_id": result.inserted_id},
                 {"$set": {
                     "message_type": message_doc["message_type"]
@@ -444,10 +445,10 @@ async def twilio_webhook(request: Request, background_tasks: BackgroundTasks):
                     "keywords": [],
                     "notification_settings": {},
                 }
-                db.groups.insert_one(group_doc)
+                await db.groups.insert_one(group_doc)
             # Check if participant exists
             sender_number = form_data.get("From")
-            participant = db.group_participants.find_one({
+            participant = await db.group_participants.find_one({
                 "group_id":
                 group_sid,
                 "phone_number":
@@ -463,7 +464,7 @@ async def twilio_webhook(request: Request, background_tasks: BackgroundTasks):
                     "added_at": datetime.now().isoformat(),
                     "is_active": True,
                 }
-                db.group_participants.insert_one(participant_doc)
+                await db.group_participants.insert_one(participant_doc)
         # --- End auto-create logic ---
 
         # Return TwiML response
@@ -485,7 +486,7 @@ async def twilio_status_webhook(request: Request):
     event_type = data.get("MessageStatus")  # e.g., 'delivered', 'sent', etc.
     if message_sid and event_type == "delivered":
         # Find the message with escalation.alert_sid == message_sid
-        result = db.messages.update_one(
+        result = await db.messages.update_one(
             {"escalation.alert_sid": message_sid},
             {"$set": {
                 "escalation.delivered": True
@@ -511,7 +512,7 @@ async def create_group(
             notification_settings=group.notification_settings or {},
         )
         
-        db.groups.insert_one(group_config.dict())
+        await db.groups.insert_one(group_config.dict())
         return group_config
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -519,9 +520,9 @@ async def create_group(
 
 @app.get("/api/groups", response_model=List[GroupConfig])
 async def list_groups():
-    cursor = db.groups.find()
+    cursor = await db.groups.find()
     groups = await cursor.to_list(length=100)
-        return [GroupConfig(**group) for group in groups]
+    return [GroupConfig(**group) for group in groups]
 
 
 @app.get("/api/groups/{group_sid}", response_model=GroupConfig)
@@ -549,7 +550,7 @@ async def update_group(group_sid: str, group_update: GroupUpdate):
         if not update_data:
             raise HTTPException(status_code=400,
                                 detail="No update data provided")
-        result = db.groups.find_one_and_update({"group_sid": group_sid},
+        result = await db.groups.find_one_and_update({"group_sid": group_sid},
             {"$set": update_data},
                                                return_document=True)
         if not result:
@@ -565,7 +566,7 @@ async def update_group(group_sid: str, group_update: GroupUpdate):
 async def delete_group(group_sid: str):
     ensure_db()
     try:
-        result = db.groups.delete_one({"group_sid": group_sid})
+        result = await db.groups.delete_one({"group_sid": group_sid})
         if result.deleted_count == 0:
             raise HTTPException(status_code=404, detail="Group not found")
         return {"status": "success", "message": "Group deleted"}
@@ -781,7 +782,7 @@ async def search_summaries(request: SearchRequest):
                                 detail="Keyword cannot be empty")
             
         # Simulate a small delay
-        time.sleep(0.8)
+        await asyncio.sleep(0.8)
         
         # Mock search results
         results = [
@@ -832,7 +833,7 @@ async def transcribe_voice_endpoint():
     """
     ensure_db()
     try:
-        transcribed_text = transcribe_voice()
+        transcribed_text = await transcribe_voice()
         return {"transcription": transcribed_text}
     except Exception as e:
         raise HTTPException(status_code=500,
@@ -850,7 +851,7 @@ async def summarize_text_endpoint(request: TextRequest):
         if not request.text.strip():
             raise HTTPException(status_code=400, detail="Text cannot be empty")
             
-        summary = summarize_text(request.text)
+        summary = await summarize_text(request.text)
         return {"summary": summary}
     except HTTPException:
         raise
@@ -860,10 +861,10 @@ async def summarize_text_endpoint(request: TextRequest):
 
 
 @app.post("/api/migrate_media_to_processed")
-def migrate_media_to_processed():
+async def migrate_media_to_processed():
     ensure_db()
     try:
-        media_docs = list(db.media.find())
+        media_docs = await db.media.find().to_list(length=None)
         migrated = 0
         for doc in media_docs:
             # Build a processed_message document
@@ -877,7 +878,7 @@ def migrate_media_to_processed():
                 "timestamp": time.time(),
                 "from": "media_migration",
             }
-            db.processed_messages.insert_one(processed_doc)
+            await db.processed_messages.insert_one(processed_doc)
             migrated += 1
         return {"status": "success", "migrated": migrated}
     except Exception as e:
@@ -903,7 +904,7 @@ def get_twilio_client():
 
 async def notify_leader_via_whatsapp(group_id, message):
     # Find the leader participant for this group
-    leader = db.group_participants.find_one({
+    leader = await db.group_participants.find_one({
         "group_id": group_id,
         "role": "leader",
         "is_active": True
@@ -916,8 +917,8 @@ async def notify_leader_via_whatsapp(group_id, message):
     notification = f"[Escalation] Client message missed by team.\nMessage: {message['body']}\nFrom: {message['sender']}\nTime: {message['timestamp']}"
     # Send WhatsApp message via Twilio
     try:
-        client = get_twilio_client()
-        client.messages.create(
+        client = await get_twilio_client()
+        await asyncio.to_thread(client.messages.create,
             from_=f"whatsapp:{TWILIO_WHATSAPP_FROM}",
             to=f"whatsapp:{leader_number}",
             body=notification,
@@ -991,10 +992,9 @@ async def check_message_escalation():
                 if leader:
                     leader_number = leader.get("phone_number")
                     try:
-                        twilio_client = TwilioClient(TWILIO_ACCOUNT_SID,
-                                                     TWILIO_AUTH_TOKEN)
+                        twilio_client = await get_twilio_client()
                         # Find the conversation for this group (assume friendly_name == group_id)
-                        conversations = twilio_client.conversations.conversations.list(
+                        conversations = await asyncio.to_thread(twilio_client.conversations.conversations.list,
                             friendly_name=message["group_id"])
                         if conversations:
                             conversation_sid = conversations[0].sid
@@ -1003,7 +1003,7 @@ async def check_message_escalation():
                                 f"Message: {message['body']}\n"
                                 f"From: {message['sender']}\n"
                                 f"Time: {message['timestamp']}")
-                            msg = twilio_client.conversations.conversations(
+                            msg = await twilio_client.conversations.conversations(
                                 conversation_sid).messages.create(
                                     author="system", body=notification)
                             alert_sid = msg.sid
@@ -1247,13 +1247,13 @@ async def toggle_user_status(
     ensure_db()
     try:
         # Find user
-        user = db.users.find_one({"username": user_id})
+        user = await db.users.find_one({"username": user_id})
         if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+            raise HTTPException(status_code=404, detail="User not found")
 
         # Toggle status
         new_status = not user.get("is_active", True)
-        result = db.users.update_one({"username": user_id},
+        result = await db.users.update_one({"username": user_id},
                                      {"$set": {
                                          "is_active": new_status
                                      }})
@@ -1280,7 +1280,7 @@ async def delete_user(
         # Check if user exists
         user = await db.users.find_one({"username": user_id})
         if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+            raise HTTPException(status_code=404, detail="User not found")
 
         # Delete user
         result = await db.users.delete_one({"username": user_id})
@@ -1352,8 +1352,8 @@ async def list_users_enhanced(
             ]
 
         # Get users with pagination
-        users = list(db.users.find(query).skip(skip).limit(limit))
-        total = db.users.count_documents(query)
+        users = await db.users.find(query).skip(skip).limit(limit).to_list(length=None)
+        total = await db.users.count_documents(query)
 
         # Convert to UserOut model and exclude sensitive fields
         user_list = []
@@ -1386,8 +1386,7 @@ async def system_status(
         inactive_groups_count = await db.groups.count_documents(
             {"is_active": False})
         daily_summaries_count = await db.daily_summaries.count_documents({})
-
-    return {
+        return {
             "users": users_count,
             "groups": groups_count,
             "messages": messages_count,
@@ -1414,13 +1413,10 @@ async def group_analytics(group_id: str):
         last_msg = await db.processed_messages.find_one(
             {"group_sid": group_id}, sort=[("timestamp", DESCENDING)])
 
-    return {
-            "group_id":
-            group_id,
-            "total_messages":
-            total_msgs,
-            "unique_users":
-            len(users),
+        return {
+            "group_id": group_id,
+            "total_messages": total_msgs,
+            "unique_users": len(users),
             "last_activity": (datetime.fromtimestamp(last_msg["timestamp"])
                               if last_msg else None),
         }
@@ -1462,7 +1458,7 @@ async def get_daily_statistics(
             },
         }
 
-        stats = list(db.group_daily_stats.find(query).sort("date", ASCENDING))
+        stats = await db.group_daily_stats.find(query).sort("date", ASCENDING).to_list(length=None)
 
         # Convert ObjectId to string for JSON serialization
         for stat in stats:
@@ -1524,7 +1520,7 @@ async def message_analytics(
         query["timestamp"] = {"$gte": start_date.timestamp()}
     if end_date:
         query.setdefault("timestamp", {})["$lte"] = end_date.timestamp()
-    total = db.processed_messages.count_documents(query)
+    total = await db.processed_messages.count_documents(query)
     return {"total": total, "filters": query}
 
 
@@ -1781,14 +1777,10 @@ def mock_daily_summaries():
 # Initialize mock group analytics data
 def mock_group_report(group_id: str, start_date: datetime, end_date: datetime):
     """Generate mock group analytics report for testing"""
-    mock_group_name = f"Group {group_id[-4:]}" if len(
-        group_id) > 4 else "Test Group"
-            
-        return {
-        "group_id":
-        group_id,
-        "group_name":
-        mock_group_name,
+    mock_group_name = f"Group {group_id[-4:]}" if len(group_id) > 4 else "Test Group"
+    return {
+        "group_id": group_id,
+        "group_name": mock_group_name,
         "date_range": {
             "start": start_date.isoformat(),
             "end": end_date.isoformat()
@@ -1804,12 +1796,9 @@ def mock_group_report(group_id: str, start_date: datetime, end_date: datetime):
                 "voice": 5
             },
         },
-        "totalMessages":
-        125,
-        "totalParticipants":
-        8,
-        "activeParticipants":
-        6,
+        "totalMessages": 125,
+        "totalParticipants": 8,
+        "activeParticipants": 6,
         "messageTypes": {
             "text": 95,
             "media": 15,
@@ -1931,7 +1920,7 @@ async def generate_summaries(
             # Skip if no activity
             if total_messages == 0:
                 results.append({
-            "group_id": group_id,
+                    "group_id": group_id,
                     "date": start_date.date().isoformat(),
                     "skipped": True,
                     "reason": "No messages in time range"
@@ -1945,7 +1934,7 @@ async def generate_summaries(
 
             # Extract message content for summarization
             message_texts = []
-        for msg in messages:
+            for msg in messages:
                 if msg.get("body"):
                     sender_prefix = f"{msg.get('from_name', 'Unknown')}: " if msg.get(
                         "from_name") else ""
@@ -1992,7 +1981,7 @@ async def generate_summaries(
                 "message_count": total_messages
             })
 
-    return {
+        return {
             "success": True,
             "date_range": {
                 "start": start_date.date().isoformat(),
@@ -2000,7 +1989,6 @@ async def generate_summaries(
             },
             "results": results
         }
-
     except Exception as e:
         import traceback
         print(f"Error generating summaries: {traceback.format_exc()}")
