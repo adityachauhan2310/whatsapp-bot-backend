@@ -69,8 +69,8 @@ A FastAPI backend for processing and managing WhatsApp messages.
 ## Default Admin Credentials
 
 If you're setting up a new system, a default admin user will be created:
-- Username: aditya2310chauhan
-- Password: Admin123!
+- Username: 
+- Password: 
 
 For security reasons, it's recommended to change this password after the first login.
 
